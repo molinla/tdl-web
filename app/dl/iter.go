@@ -394,6 +394,15 @@ func flatDialogs(dialogs [][]*tmessage.Dialog) []*tmessage.Dialog {
 	return res
 }
 
+// PrepareDialogsForResume flattens and sorts dialogs with the same rules used
+// by the downloader iterator. Web mode uses this to keep its resume fingerprint
+// and logical positions compatible with `tdl download --continue`.
+func PrepareDialogsForResume(dialogs [][]*tmessage.Dialog, desc bool) []*tmessage.Dialog {
+	flat := flatDialogs(dialogs)
+	sortDialogs(flat, desc)
+	return flat
+}
+
 func sortDialogs(dialogs []*tmessage.Dialog, desc bool) {
 	sort.Slice(dialogs, func(i, j int) bool {
 		return tutil.GetInputPeerID(dialogs[i].Peer) <
@@ -419,6 +428,13 @@ func sortDialogs(dialogs []*tmessage.Dialog, desc bool) {
 // 	}
 // 	return sum
 // }
+
+// FingerprintDialogs returns the resume fingerprint used by `tdl download`.
+// Keep this as a thin wrapper around fingerprint to avoid drift between the CLI
+// downloader and web mode.
+func FingerprintDialogs(dialogs []*tmessage.Dialog) string {
+	return fingerprint(dialogs)
+}
 
 func fingerprint(dialogs []*tmessage.Dialog) string {
 	endian := binary.BigEndian

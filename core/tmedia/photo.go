@@ -31,14 +31,35 @@ func GetPhotoInfo(photo *tg.MessageMediaPhoto) (*Media, bool) {
 	}, true
 }
 
+// GetPhotoSize picks the largest downloadable photo size.
+// Prefer real PhotoSize / Progressive over in-memory CachedSize.
 func GetPhotoSize(sizes []tg.PhotoSizeClass) (string, int, bool) {
-	size := sizes[len(sizes)-1]
-	switch s := size.(type) {
-	case *tg.PhotoSize:
-		return s.Type, s.Size, true
-	case *tg.PhotoSizeProgressive:
-		return s.Type, s.Sizes[len(s.Sizes)-1], true
+	var (
+		bestType string
+		bestSize int
+		found    bool
+	)
+	for _, size := range sizes {
+		switch s := size.(type) {
+		case *tg.PhotoSize:
+			if !found || s.Size >= bestSize {
+				bestType, bestSize, found = s.Type, s.Size, true
+			}
+		case *tg.PhotoSizeProgressive:
+			sz := 0
+			if n := len(s.Sizes); n > 0 {
+				sz = s.Sizes[n-1]
+			}
+			if !found || sz >= bestSize {
+				bestType, bestSize, found = s.Type, sz, true
+			}
+		case *tg.PhotoCachedSize:
+			sz := len(s.Bytes)
+			// Only use cached bytes when no remote size exists yet.
+			if !found {
+				bestType, bestSize, found = s.Type, sz, true
+			}
+		}
 	}
-
-	return "", 0, false
+	return bestType, bestSize, found
 }

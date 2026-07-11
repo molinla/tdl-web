@@ -111,6 +111,14 @@ func collect(ctx context.Context, r io.Reader, peer peers.Peer, onlyMedia bool) 
 			}
 
 			m.Messages = append(m.Messages, fm.ID)
+			if fm.Time != "" {
+				if ts, err := strconv.ParseInt(fm.Time, 10, 64); err == nil && ts > 0 {
+					if m.Dates == nil {
+						m.Dates = map[int]int64{}
+					}
+					m.Dates[fm.ID] = ts
+				}
+			}
 		}
 	}
 
