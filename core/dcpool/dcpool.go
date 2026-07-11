@@ -24,6 +24,7 @@ type Pool interface {
 	Client(ctx context.Context, dc int) *tg.Client
 	Takeout(ctx context.Context, dc int) *tg.Client
 	Default(ctx context.Context) *tg.Client
+	DefaultTakeout(ctx context.Context) *tg.Client
 	Close() error
 }
 
@@ -98,6 +99,10 @@ func (p *pool) Default(ctx context.Context) *tg.Client {
 	return p.Client(ctx, p.current())
 }
 
+func (p *pool) DefaultTakeout(ctx context.Context) *tg.Client {
+	return p.Takeout(ctx, p.current())
+}
+
 func (p *pool) Close() (err error) {
 	if p.takeout != 0 {
 		err = takeout.UnTakeout(context.TODO(), p.Takeout(context.TODO(), p.current()).Invoker())
@@ -120,7 +125,7 @@ func (p *pool) Takeout(ctx context.Context, dc int) *tg.Client {
 		if err != nil {
 			logctx.From(ctx).Warn("takeout error", zap.Error(err))
 			// ignore init delay error and return non-takeout client
-			return p.Client(ctx, dc)
+			return tg.NewClient(p.invoker(ctx, dc))
 		}
 		p.takeout = sid
 		logctx.From(ctx).Info("get takeout id", zap.Int64("id", sid))

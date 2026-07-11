@@ -146,6 +146,13 @@ func (i *iter) Next(ctx context.Context) bool {
 	}
 }
 
+func (i *iter) messageClient(ctx context.Context) *tg.Client {
+	if i.opts.Takeout {
+		return i.pool.DefaultTakeout(ctx)
+	}
+	return i.pool.Default(ctx)
+}
+
 func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 	i.mu.Lock()
 	defer i.mu.Unlock()
@@ -173,7 +180,7 @@ func (i *iter) process(ctx context.Context) (ret bool, skip bool) {
 		i.err = errors.Wrap(err, "resolve from input peer")
 		return false, false
 	}
-	message, err := tutil.GetSingleMessage(ctx, i.pool.Default(ctx), peer, msg)
+	message, err := tutil.GetSingleMessage(ctx, i.messageClient(ctx), peer, msg)
 	if err != nil {
 		// Check if the error is due to a deleted message
 		if errors.Is(err, tutil.ErrMessageDeleted) {
@@ -281,7 +288,7 @@ func (i *iter) processSingle(ctx context.Context, message *tg.Message, from peer
 }
 
 func (i *iter) processGrouped(ctx context.Context, message *tg.Message, from peers.Peer, startLogicalPos int) (bool, bool) {
-	grouped, err := tutil.GetGroupedMessages(ctx, i.pool.Default(ctx), from.InputPeer(), message)
+	grouped, err := tutil.GetGroupedMessages(ctx, i.messageClient(ctx), from.InputPeer(), message)
 	if err != nil {
 		i.err = errors.Wrapf(err, "resolve grouped message %d/%d", from.ID(), message.ID)
 		return false, false
