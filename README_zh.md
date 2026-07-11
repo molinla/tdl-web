@@ -35,6 +35,15 @@
 
 ![](docs/assets/img/preview.gif)
 
+## 网页预览（tdl-web）
+
+本改造版提供解耦的网页预览：
+
+1. **API**：`tdl web -f result.json -d <dir> --continue [--type id|time -i from,to]`
+2. **前端**：`cd web && npm install && npm run dev` → http://127.0.0.1:5173
+
+视频展示封面/时长/大小，播放时边下边播并落盘到 `--dir` 供 Jellyfin 扫描。详见 [HANDOFF.md](HANDOFF.md)。
+
 ## 文档
 
 请参考 [文档](https://docs.iyear.me/tdl/zh/).
