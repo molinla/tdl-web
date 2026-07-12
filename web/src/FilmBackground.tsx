@@ -1,9 +1,69 @@
-import { useMemo, type CSSProperties } from "react";
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+  type MouseEvent as ReactMouseEvent,
+  type PointerEvent as ReactPointerEvent,
+} from "react";
 import { coverURL } from "./api";
 import type { Item } from "./types";
 
 const COLUMN_COUNT = 14;
 const FRAMES_PER_COL = 16;
+const FILM_ACCELERATE_MS = 1200;
+const FILM_OBSCURED_HOLD_MS = 1400;
+const FILM_DECELERATE_MS = 2600;
+const FILM_INITIAL_ENTER_MS = 5000;
+const FILM_FAST_SPEED_MULTIPLIER = 48;
+const FILM_ROTATION = -Math.PI / 4;
+const FILM_BASE_OPACITY = 0.17;
+const FILM_OBSCURED_OPACITY = 0.2;
+const FILM_BLUR_PX = 26;
+const MAX_DPR = 2;
+
+type FilmFrameData = {
+  item: Item;
+  url: string;
+};
+
+type FilmLayerData = {
+  signature: string;
+  columnFrames: FilmFrameData[][];
+  coverCount: number;
+  urls: string[];
+};
+
+type FilmMotionPhase = "idle" | "accelerating" | "obscured" | "decelerating";
+type FilmInitialPhase = "waiting" | "entering" | "done";
+
+type CanvasSize = {
+  width: number;
+  height: number;
+  dpr: number;
+};
+
+type FilmMetrics = {
+  filmSize: number;
+  columnGap: number;
+  columnWidth: number;
+  sprocketWidth: number;
+  frameHeight: number;
+  pitch: number;
+  cycle: number;
+};
+
+type ImageCacheEntry = {
+  image: HTMLImageElement;
+  status: "loading" | "ready" | "error";
+  promise: Promise<void>;
+};
+
+export type FilmClickDetail = {
+  item: Item;
+  frameKey: string;
+  originRect: DOMRectReadOnly;
+};
 
 function coverPath(item: Item): string | undefined {
   if (item.type === "video") return item.cover || item.thumb_url;
@@ -12,7 +72,7 @@ function coverPath(item: Item): string | undefined {
 
 function hashId(id: string): number {
   let h = 0;
-  for (let i = 0; i < id.length; i++) h = (h * 31 + id.charCodeAt(i)) | 0;
+  for (let i = 0; i < id.length; i += 1) h = (h * 31 + id.charCodeAt(i)) | 0;
   return h;
 }
 
@@ -20,8 +80,15 @@ function sortedPool(items: Item[]): Item[] {
   return [...items].sort((a, b) => hashId(a.id) - hashId(b.id));
 }
 
+function sourceSignature(items: Item[]): string {
+  return items
+    .map((item) => item.id)
+    .sort()
+    .join("|");
+}
+
 /** Each column draws from its own non-overlapping item slice. */
-function pickColumnCoverUrls(allItems: Item[], colIndex: number): string[] {
+function pickColumnFrames(allItems: Item[], colIndex: number): FilmFrameData[] {
   const withCover = allItems.filter((i) => coverPath(i));
   if (!withCover.length) return [];
 
@@ -49,89 +116,772 @@ function pickColumnCoverUrls(allItems: Item[], colIndex: number): string[] {
       ? partitioned
       : [sortedPool(pool)[slot % pool.length]];
 
-  const urls: string[] = [];
-  for (let i = 0; i < FRAMES_PER_COL; i++) {
+  const frames: FilmFrameData[] = [];
+  for (let i = 0; i < FRAMES_PER_COL; i += 1) {
     const item = source[i % source.length];
     const path = coverPath(item);
-    if (path) urls.push(coverURL(path, item.status));
+    if (path) frames.push({ item, url: coverURL(path) });
   }
-  return urls;
+  return frames;
 }
 
-function FilmFrame({ src, index }: { src?: string; index: number }) {
-  return (
-    <div className="film-frame">
-      <div className="film-sprocket film-sprocket--side" aria-hidden="true" />
-      <div className="film-frame-img">
-        {src ? (
-          <img
-            src={src}
-            alt=""
-            loading="lazy"
-            decoding="async"
-            draggable={false}
-          />
-        ) : (
-          <div className="film-frame-empty" />
-        )}
-      </div>
-      <div className="film-sprocket film-sprocket--side" aria-hidden="true" />
-      <span className="film-frame-num" aria-hidden="true">
-        {String(index + 1).padStart(3, "0")}
-      </span>
-    </div>
+function buildFilmLayer(items: Item[]): FilmLayerData {
+  const columnFrames = Array.from({ length: COLUMN_COUNT }, (_, i) =>
+    pickColumnFrames(items, i),
+  );
+  const urls = Array.from(
+    new Set(columnFrames.flatMap((frames) => frames.map((frame) => frame.url))),
+  );
+
+  return {
+    signature: sourceSignature(items),
+    columnFrames,
+    coverCount: columnFrames.reduce((sum, frames) => sum + frames.length, 0),
+    urls,
+  };
+}
+
+function mod(value: number, size: number): number {
+  return ((value % size) + size) % size;
+}
+
+function clamp(value: number, min: number, max: number): number {
+  return Math.min(max, Math.max(min, value));
+}
+
+function lerp(a: number, b: number, t: number): number {
+  return a + (b - a) * t;
+}
+
+function easeOutCubic(t: number): number {
+  return 1 - Math.pow(1 - clamp(t, 0, 1), 3);
+}
+
+function easeInOutCubic(t: number): number {
+  const p = clamp(t, 0, 1);
+  return p < 0.5 ? 4 * p * p * p : 1 - Math.pow(-2 * p + 2, 3) / 2;
+}
+
+function frameKeyFor(layer: FilmLayerData, colIndex: number, frameIndex: number): string {
+  return `${layer.signature}:${colIndex}:${frameIndex}`;
+}
+
+function computeMetrics(width: number, height: number): FilmMetrics {
+  const filmSize = Math.max(width, height) * 2;
+  const columnGap = 5;
+  const columnWidth = (filmSize - columnGap * (COLUMN_COUNT - 1)) / COLUMN_COUNT;
+  const sprocketWidth = Math.max(4, Math.min(8, columnWidth * 0.035));
+  const imageWidth = Math.max(1, columnWidth - sprocketWidth * 2);
+  const frameHeight = imageWidth * (16 / 9) + 4;
+  const pitch = frameHeight + columnGap;
+
+  return {
+    filmSize,
+    columnGap,
+    columnWidth,
+    sprocketWidth,
+    frameHeight,
+    pitch,
+    cycle: pitch * FRAMES_PER_COL,
+  };
+}
+
+function objectFitCoverRect(
+  image: HTMLImageElement,
+  dx: number,
+  dy: number,
+  dw: number,
+  dh: number,
+) {
+  const iw = image.naturalWidth || image.width;
+  const ih = image.naturalHeight || image.height;
+  if (iw <= 0 || ih <= 0) return null;
+
+  const scale = Math.max(dw / iw, dh / ih);
+  const sw = dw / scale;
+  const sh = dh / scale;
+  return {
+    sx: (iw - sw) / 2,
+    sy: (ih - sh) / 2,
+    sw,
+    sh,
+    dx,
+    dy,
+    dw,
+    dh,
+  };
+}
+
+function contentRectToScreenRect(
+  rect: { x: number; y: number; width: number; height: number },
+  metrics: FilmMetrics,
+  size: CanvasSize,
+): DOMRectReadOnly {
+  const cos = Math.cos(FILM_ROTATION);
+  const sin = Math.sin(FILM_ROTATION);
+  const localX = rect.x + rect.width / 2 - metrics.filmSize / 2;
+  const localY = rect.y + rect.height / 2 - metrics.filmSize / 2;
+  const centerX = size.width / 2 + localX * cos - localY * sin;
+  const centerY = size.height / 2 + localX * sin + localY * cos;
+  return new DOMRect(
+    centerX - rect.width / 2,
+    centerY - rect.height / 2,
+    rect.width,
+    rect.height,
   );
 }
 
-function FilmColumn({
-  colIndex,
-  coverUrls,
+export function FilmBackground({
+  items,
+  onItemClick,
 }: {
-  colIndex: number;
-  coverUrls: string[];
+  items: Item[];
+  onItemClick?: (detail: FilmClickDetail) => void;
 }) {
-  const frames = useMemo(() => {
-    const seq = Array.from({ length: FRAMES_PER_COL }, (_, i) => {
-      const url = coverUrls.length ? coverUrls[i % coverUrls.length] : undefined;
-      return { key: `a-${i}`, url, index: i };
-    });
-    const dup = seq.map((f) => ({ ...f, key: `b-${f.key}` }));
-    return [...seq, ...dup];
-  }, [coverUrls]);
+  const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const activeLayerRef = useRef<FilmLayerData>(buildFilmLayer(items));
+  const pendingLayerRef = useRef<FilmLayerData | null>(null);
+  const pendingLayerReadyRef = useRef(false);
+  const motionPhaseRef = useRef<FilmMotionPhase>("idle");
+  const motionPhaseStartRef = useRef(0);
+  const initialPhaseRef = useRef<FilmInitialPhase>("waiting");
+  const initialStartRef = useRef(0);
+  const initialTokenRef = useRef(0);
+  const imageCacheRef = useRef(new Map<string, ImageCacheEntry>());
+  const offsetsRef = useRef<number[]>(Array(COLUMN_COUNT).fill(0));
+  const speedMultiplierRef = useRef(1);
+  const sideHoverRef = useRef(false);
+  const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
+  const rafRef = useRef<number | null>(null);
+  const lastFrameRef = useRef<number | null>(null);
+  const obscureTimerRef = useRef<number | null>(null);
+  const holdTimerRef = useRef<number | null>(null);
+  const endTimerRef = useRef<number | null>(null);
+  const initialEndTimerRef = useRef<number | null>(null);
+  const [reducedMotion, setReducedMotion] = useState(false);
+  const reducedMotionRef = useRef(false);
+  const nextLayer = useMemo(() => buildFilmLayer(items), [items]);
 
-  const reverse = colIndex % 2 === 1;
-  const duration = 68 + colIndex * 10;
+  function ensureImage(url: string): ImageCacheEntry {
+    const cached = imageCacheRef.current.get(url);
+    if (cached) return cached;
+
+    const image = new Image();
+    image.decoding = "async";
+    const entry: ImageCacheEntry = {
+      image,
+      status: "loading",
+      promise: Promise.resolve(),
+    };
+    entry.promise = new Promise<void>((resolve) => {
+      image.onload = () => {
+        entry.status = "ready";
+        resolve();
+      };
+      image.onerror = () => {
+        entry.status = "error";
+        resolve();
+      };
+    });
+    image.src = url;
+    imageCacheRef.current.set(url, entry);
+    return entry;
+  }
+
+  function preloadLayer(layer: FilmLayerData): Promise<void> {
+    if (layer.urls.length === 0) return Promise.resolve();
+    return Promise.all(layer.urls.map((url) => ensureImage(url).promise)).then(
+      () => undefined,
+    );
+  }
+
+  function clearMotionTimers() {
+    if (obscureTimerRef.current != null) {
+      window.clearTimeout(obscureTimerRef.current);
+      obscureTimerRef.current = null;
+    }
+    if (holdTimerRef.current != null) {
+      window.clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    if (endTimerRef.current != null) {
+      window.clearTimeout(endTimerRef.current);
+      endTimerRef.current = null;
+    }
+  }
+
+  function setMotionPhase(phase: FilmMotionPhase) {
+    motionPhaseRef.current = phase;
+    motionPhaseStartRef.current = performance.now();
+  }
+
+  function swapPendingLayer() {
+    const pending = pendingLayerRef.current;
+    if (!pending || pending.coverCount <= 0 || !pendingLayerReadyRef.current) {
+      return false;
+    }
+
+    activeLayerRef.current = pending;
+    pendingLayerRef.current = null;
+    pendingLayerReadyRef.current = false;
+    return true;
+  }
+
+  function scheduleDeceleration() {
+    if (holdTimerRef.current != null) window.clearTimeout(holdTimerRef.current);
+    if (endTimerRef.current != null) window.clearTimeout(endTimerRef.current);
+
+    holdTimerRef.current = window.setTimeout(() => {
+      holdTimerRef.current = null;
+      setMotionPhase("decelerating");
+      endTimerRef.current = window.setTimeout(() => {
+        endTimerRef.current = null;
+        setMotionPhase("idle");
+      }, FILM_DECELERATE_MS);
+    }, FILM_OBSCURED_HOLD_MS);
+  }
+
+  function trySwapAndRecover() {
+    if (motionPhaseRef.current !== "obscured") return;
+    if (!swapPendingLayer()) return;
+    scheduleDeceleration();
+  }
+
+  function enterObscuredPhase() {
+    if (obscureTimerRef.current != null) {
+      window.clearTimeout(obscureTimerRef.current);
+      obscureTimerRef.current = null;
+    }
+    if (holdTimerRef.current != null) {
+      window.clearTimeout(holdTimerRef.current);
+      holdTimerRef.current = null;
+    }
+    if (endTimerRef.current != null) {
+      window.clearTimeout(endTimerRef.current);
+      endTimerRef.current = null;
+    }
+    setMotionPhase("obscured");
+    trySwapAndRecover();
+  }
+
+  function startMotionCycle() {
+    if (motionPhaseRef.current === "idle") {
+      clearMotionTimers();
+      setMotionPhase("accelerating");
+      obscureTimerRef.current = window.setTimeout(
+        enterObscuredPhase,
+        FILM_ACCELERATE_MS,
+      );
+      return;
+    }
+
+    if (motionPhaseRef.current === "accelerating") return;
+    enterObscuredPhase();
+  }
+
+  function startInitialEnter() {
+    if (initialPhaseRef.current !== "waiting") return;
+    initialPhaseRef.current = "entering";
+    initialStartRef.current = performance.now();
+    if (initialEndTimerRef.current != null) {
+      window.clearTimeout(initialEndTimerRef.current);
+    }
+    initialEndTimerRef.current = window.setTimeout(() => {
+      initialEndTimerRef.current = null;
+      initialPhaseRef.current = "done";
+    }, FILM_INITIAL_ENTER_MS);
+  }
+
+  function waitForInitialLayer(layer: FilmLayerData) {
+    const token = (initialTokenRef.current += 1);
+    if (reducedMotionRef.current) {
+      initialPhaseRef.current = "done";
+      return;
+    }
+    initialPhaseRef.current = "waiting";
+    preloadLayer(layer).then(() => {
+      if (initialTokenRef.current !== token) return;
+      startInitialEnter();
+    });
+  }
+
+  function ensureCanvasSize(canvas: HTMLCanvasElement): CanvasSize {
+    const rect = canvas.getBoundingClientRect();
+    const width = Math.max(1, Math.round(rect.width || window.innerWidth));
+    const height = Math.max(1, Math.round(rect.height || window.innerHeight));
+    const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
+    const pixelWidth = Math.round(width * dpr);
+    const pixelHeight = Math.round(height * dpr);
+    if (canvas.width !== pixelWidth || canvas.height !== pixelHeight) {
+      canvas.width = pixelWidth;
+      canvas.height = pixelHeight;
+    }
+    return { width, height, dpr };
+  }
+
+  function isSidePoint(clientX: number) {
+    const gutter = Math.max(0, (window.innerWidth - 1400) / 2);
+    return (
+      gutter > 0 &&
+      (clientX <= gutter || clientX >= window.innerWidth - gutter)
+    );
+  }
+
+  function columnIntroDelta(colIndex: number, metrics: FilmMetrics, now: number) {
+    if (initialPhaseRef.current === "done") return 0;
+    if (initialPhaseRef.current === "waiting") {
+      return colIndex % 2 === 0 ? -metrics.filmSize * 1.2 : metrics.filmSize * 1.2;
+    }
+    const progress = (now - initialStartRef.current) / FILM_INITIAL_ENTER_MS;
+    const eased = easeOutCubic(progress);
+    const start = colIndex % 2 === 0 ? -metrics.filmSize * 1.2 : metrics.filmSize * 1.2;
+    return lerp(start, 0, eased);
+  }
+
+  function hitTest(clientX: number, clientY: number) {
+    if (initialPhaseRef.current === "waiting") return null;
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const size = ensureCanvasSize(canvas);
+    const metrics = computeMetrics(size.width, size.height);
+    const layer = activeLayerRef.current;
+    if (layer.coverCount <= 0) return null;
+
+    const dx = clientX - size.width / 2;
+    const dy = clientY - size.height / 2;
+    const cos = Math.cos(-FILM_ROTATION);
+    const sin = Math.sin(-FILM_ROTATION);
+    const filmX = dx * cos - dy * sin;
+    const filmY = dx * sin + dy * cos;
+    const contentX = filmX + metrics.filmSize / 2;
+    const contentY = filmY + metrics.filmSize / 2;
+    if (
+      contentX < 0 ||
+      contentY < 0 ||
+      contentX > metrics.filmSize ||
+      contentY > metrics.filmSize
+    ) {
+      return null;
+    }
+
+    const colStep = metrics.columnWidth + metrics.columnGap;
+    const colIndex = Math.floor(contentX / colStep);
+    if (colIndex < 0 || colIndex >= COLUMN_COUNT) return null;
+    const xInCol = contentX - colIndex * colStep;
+    if (xInCol < 0 || xInCol > metrics.columnWidth) return null;
+
+    const frames = layer.columnFrames[colIndex] ?? [];
+    if (!frames.length) return null;
+
+    const now = performance.now();
+    const trackY = contentY - columnIntroDelta(colIndex, metrics, now);
+    const cycle = metrics.pitch * frames.length;
+    const inCycle = mod(trackY + offsetsRef.current[colIndex], cycle);
+    const frameIndex = Math.floor(inCycle / metrics.pitch);
+    const yInFrame = inCycle - frameIndex * metrics.pitch;
+    if (yInFrame > metrics.frameHeight) return null;
+
+    const cycleBase = Math.floor((trackY + offsetsRef.current[colIndex] - inCycle) / cycle) * cycle;
+    const frameY =
+      cycleBase +
+      frameIndex * metrics.pitch -
+      offsetsRef.current[colIndex] +
+      columnIntroDelta(colIndex, metrics, now);
+    const frameX = colIndex * colStep;
+    const frame = frames[frameIndex];
+    if (!frame || frame.item.type === "file") return null;
+
+    return {
+      item: frame.item,
+      frameKey: frameKeyFor(layer, colIndex, frameIndex),
+      originRect: contentRectToScreenRect(
+        {
+          x: frameX,
+          y: frameY,
+          width: metrics.columnWidth,
+          height: metrics.frameHeight,
+        },
+        metrics,
+        size,
+      ),
+    };
+  }
+
+  function updateSideHover(clientX: number, clientY: number) {
+    lastPointerRef.current = { x: clientX, y: clientY };
+    sideHoverRef.current = isSidePoint(clientX);
+    return sideHoverRef.current ? hitTest(clientX, clientY) : null;
+  }
+
+  function handlePointerMove(event: ReactPointerEvent<HTMLElement>) {
+    updateSideHover(event.clientX, event.clientY);
+  }
+
+  function handlePointerLeave() {
+    sideHoverRef.current = false;
+  }
+
+  function handleSideClick(event: ReactMouseEvent<HTMLElement>) {
+    const hit = updateSideHover(event.clientX, event.clientY);
+    if (!hit) return;
+    onItemClick?.(hit);
+  }
+
+  function updateSideHoverFromLastPointer() {
+    const point = lastPointerRef.current;
+    sideHoverRef.current = point ? isSidePoint(point.x) : false;
+  }
+
+  function motionVisuals(now: number) {
+    const phase = motionPhaseRef.current;
+    const elapsed = now - motionPhaseStartRef.current;
+    if (phase === "accelerating") {
+      const p = easeInOutCubic(elapsed / FILM_ACCELERATE_MS);
+      return {
+        blur: FILM_BLUR_PX * p,
+        opacity: lerp(FILM_BASE_OPACITY, FILM_OBSCURED_OPACITY, p),
+        speed: lerp(1, FILM_FAST_SPEED_MULTIPLIER, p),
+      };
+    }
+    if (phase === "obscured") {
+      return {
+        blur: FILM_BLUR_PX,
+        opacity: FILM_OBSCURED_OPACITY,
+        speed: FILM_FAST_SPEED_MULTIPLIER,
+      };
+    }
+    if (phase === "decelerating") {
+      const p = easeOutCubic(elapsed / FILM_DECELERATE_MS);
+      return {
+        blur: lerp(FILM_BLUR_PX, 0, p),
+        opacity: lerp(FILM_OBSCURED_OPACITY, FILM_BASE_OPACITY, p),
+        speed: lerp(FILM_FAST_SPEED_MULTIPLIER, 1, p),
+      };
+    }
+    return { blur: 0, opacity: FILM_BASE_OPACITY, speed: 1 };
+  }
+
+  function drawSprocket(
+    ctx: CanvasRenderingContext2D,
+    x: number,
+    y: number,
+    width: number,
+    height: number,
+  ) {
+    ctx.fillStyle = "rgba(8, 8, 8, 0.95)";
+    ctx.fillRect(x, y, width, height);
+    ctx.fillStyle = "rgba(229, 9, 20, 0.16)";
+    for (let yy = y + 4; yy < y + height; yy += 12) {
+      ctx.fillRect(x, yy, width, 2);
+    }
+  }
+
+  function drawFrame(
+    ctx: CanvasRenderingContext2D,
+    frame: FilmFrameData,
+    frameIndex: number,
+    x: number,
+    y: number,
+    metrics: FilmMetrics,
+  ) {
+    ctx.fillStyle = "rgba(12, 12, 12, 0.92)";
+    ctx.fillRect(x, y, metrics.columnWidth, metrics.frameHeight);
+    ctx.fillStyle = "rgba(229, 9, 20, 0.12)";
+    ctx.fillRect(x, y, metrics.columnWidth, 2);
+    ctx.fillRect(x, y + metrics.frameHeight - 2, metrics.columnWidth, 2);
+
+    drawSprocket(ctx, x, y, metrics.sprocketWidth, metrics.frameHeight);
+    drawSprocket(
+      ctx,
+      x + metrics.columnWidth - metrics.sprocketWidth,
+      y,
+      metrics.sprocketWidth,
+      metrics.frameHeight,
+    );
+
+    const imageX = x + metrics.sprocketWidth;
+    const imageY = y + 2;
+    const imageW = metrics.columnWidth - metrics.sprocketWidth * 2;
+    const imageH = metrics.frameHeight - 4;
+    const imageOpacity = 0.85;
+
+    ctx.fillStyle = "rgba(24, 24, 24, 0.9)";
+    ctx.fillRect(imageX, imageY, imageW, imageH);
+
+    const cached = imageCacheRef.current.get(frame.url);
+    if (cached?.status === "ready") {
+      const fit = objectFitCoverRect(cached.image, imageX, imageY, imageW, imageH);
+      if (fit && imageOpacity > 0.001) {
+        ctx.save();
+        ctx.globalAlpha *= imageOpacity;
+        ctx.beginPath();
+        ctx.rect(imageX, imageY, imageW, imageH);
+        ctx.clip();
+        ctx.translate(imageX + imageW / 2, imageY + imageH / 2);
+        ctx.drawImage(
+          cached.image,
+          fit.sx,
+          fit.sy,
+          fit.sw,
+          fit.sh,
+          -imageW / 2,
+          -imageH / 2,
+          imageW,
+          imageH,
+        );
+        ctx.restore();
+      }
+    }
+
+    ctx.fillStyle = "rgba(255, 255, 255, 0.25)";
+    ctx.font = "10px sans-serif";
+    ctx.textAlign = "right";
+    ctx.textBaseline = "bottom";
+    ctx.fillText(
+      String(frameIndex + 1).padStart(3, "0"),
+      x + metrics.columnWidth - 8,
+      y + metrics.frameHeight - 5,
+    );
+  }
+
+  function draw(now: number, size: CanvasSize) {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext("2d");
+    if (!ctx) return;
+
+    ctx.setTransform(size.dpr, 0, 0, size.dpr, 0, 0);
+    ctx.clearRect(0, 0, size.width, size.height);
+
+    if (initialPhaseRef.current === "waiting") return;
+
+    const layer = activeLayerRef.current;
+    if (layer.coverCount <= 0) return;
+
+    const metrics = computeMetrics(size.width, size.height);
+    ctx.save();
+    ctx.translate(size.width / 2, size.height / 2);
+    ctx.rotate(FILM_ROTATION);
+    ctx.translate(-metrics.filmSize / 2, -metrics.filmSize / 2);
+    ctx.beginPath();
+    ctx.rect(0, 0, metrics.filmSize, metrics.filmSize);
+    ctx.clip();
+
+    ctx.fillStyle = "rgba(229, 9, 20, 0.025)";
+    ctx.fillRect(0, 0, metrics.filmSize, metrics.filmSize);
+
+    const colStep = metrics.columnWidth + metrics.columnGap;
+    for (let colIndex = 0; colIndex < COLUMN_COUNT; colIndex += 1) {
+      const frames = layer.columnFrames[colIndex] ?? [];
+      if (!frames.length) continue;
+
+      const x = colIndex * colStep;
+      const cycle = metrics.pitch * frames.length;
+      const offset = mod(offsetsRef.current[colIndex], cycle);
+      const introDelta = columnIntroDelta(colIndex, metrics, now);
+      const first = Math.floor((-metrics.frameHeight - introDelta + offset) / metrics.pitch);
+
+      for (let n = first; ; n += 1) {
+        const y = n * metrics.pitch - offset + introDelta;
+        if (y > metrics.filmSize) break;
+        if (y + metrics.frameHeight < 0) continue;
+        const frameIndex = mod(n, frames.length);
+        const frame = frames[frameIndex];
+        if (!frame) continue;
+        drawFrame(
+          ctx,
+          frame,
+          frameIndex,
+          x,
+          y,
+          metrics,
+        );
+      }
+    }
+
+    ctx.restore();
+  }
+
+  useEffect(() => {
+    reducedMotionRef.current = reducedMotion;
+    if (reducedMotion) {
+      initialPhaseRef.current = "done";
+      pendingLayerRef.current = null;
+      pendingLayerReadyRef.current = false;
+      clearMotionTimers();
+      setMotionPhase("idle");
+      speedMultiplierRef.current = 0;
+    }
+  }, [reducedMotion]);
+
+  useEffect(() => {
+    const media = window.matchMedia("(prefers-reduced-motion: reduce)");
+    const updateReducedMotion = () => setReducedMotion(media.matches);
+    updateReducedMotion();
+    media.addEventListener("change", updateReducedMotion);
+    return () => media.removeEventListener("change", updateReducedMotion);
+  }, []);
+
+  useEffect(() => {
+    const current = activeLayerRef.current;
+    if (nextLayer.coverCount === 0 && current.coverCount > 0) return;
+
+    if (current.signature === nextLayer.signature) {
+      activeLayerRef.current = nextLayer;
+      void preloadLayer(nextLayer);
+      return;
+    }
+
+    if (reducedMotionRef.current || initialPhaseRef.current !== "done") {
+      activeLayerRef.current = nextLayer;
+      pendingLayerRef.current = null;
+      pendingLayerReadyRef.current = false;
+      if (initialPhaseRef.current !== "done") waitForInitialLayer(nextLayer);
+      return;
+    }
+
+    pendingLayerRef.current = nextLayer;
+    pendingLayerReadyRef.current = false;
+    preloadLayer(nextLayer).then(() => {
+      if (pendingLayerRef.current?.signature !== nextLayer.signature) return;
+      pendingLayerReadyRef.current = true;
+      trySwapAndRecover();
+    });
+    startMotionCycle();
+  }, [nextLayer]);
+
+  useEffect(() => {
+    if (initialPhaseRef.current === "waiting") {
+      waitForInitialLayer(activeLayerRef.current);
+    }
+  }, []);
+
+  useEffect(() => {
+    const updateFromPointer = (event: PointerEvent) => {
+      lastPointerRef.current = { x: event.clientX, y: event.clientY };
+      updateSideHover(event.clientX, event.clientY);
+    };
+    const handlePointerOut = (event: PointerEvent) => {
+      if (!event.relatedTarget) {
+        lastPointerRef.current = null;
+        sideHoverRef.current = false;
+      }
+    };
+    window.addEventListener("pointermove", updateFromPointer);
+    window.addEventListener("pointerdown", updateFromPointer);
+    window.addEventListener("pointerout", handlePointerOut);
+    return () => {
+      window.removeEventListener("pointermove", updateFromPointer);
+      window.removeEventListener("pointerdown", updateFromPointer);
+      window.removeEventListener("pointerout", handlePointerOut);
+    };
+  }, []);
+
+  useEffect(() => {
+    const tick = (now: number) => {
+      const canvas = canvasRef.current;
+      if (!canvas) {
+        rafRef.current = window.requestAnimationFrame(tick);
+        return;
+      }
+      const size = ensureCanvasSize(canvas);
+      const last = lastFrameRef.current ?? now;
+      const dt = Math.min((now - last) / 1000, 0.05);
+      lastFrameRef.current = now;
+      updateSideHoverFromLastPointer();
+
+      const visuals = reducedMotionRef.current
+        ? { blur: 0, opacity: FILM_BASE_OPACITY, speed: 0 }
+        : motionVisuals(now);
+      const targetSpeed = sideHoverRef.current ? 0 : visuals.speed;
+      const ease = 1 - Math.exp(-dt / 0.22);
+      speedMultiplierRef.current +=
+        (targetSpeed - speedMultiplierRef.current) * ease;
+
+      if (!reducedMotionRef.current && initialPhaseRef.current !== "waiting") {
+        const metrics = computeMetrics(size.width, size.height);
+        for (let i = 0; i < COLUMN_COUNT; i += 1) {
+          const frames = activeLayerRef.current.columnFrames[i] ?? [];
+          if (!frames.length) continue;
+          const cycle = metrics.pitch * frames.length;
+          const baseDuration = 68 + i * 10;
+          const direction = i % 2 === 1 ? -1 : 1;
+          offsetsRef.current[i] = mod(
+            offsetsRef.current[i] +
+              direction *
+                (cycle / baseDuration) *
+                speedMultiplierRef.current *
+                dt,
+            cycle,
+          );
+        }
+      }
+
+      let opacity = visuals.opacity;
+      if (initialPhaseRef.current === "waiting") {
+        opacity = 0;
+      } else if (initialPhaseRef.current === "entering") {
+        const p = (now - initialStartRef.current) / FILM_INITIAL_ENTER_MS;
+        opacity *= easeOutCubic(p / 0.18);
+      }
+      canvas.style.opacity = String(opacity);
+      canvas.style.filter = visuals.blur > 0.1 ? `blur(${visuals.blur.toFixed(1)}px)` : "none";
+
+      draw(now, size);
+      rafRef.current = window.requestAnimationFrame(tick);
+    };
+
+    rafRef.current = window.requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current != null) {
+        window.cancelAnimationFrame(rafRef.current);
+        rafRef.current = null;
+      }
+      lastFrameRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
+    return () => {
+      clearMotionTimers();
+      if (initialEndTimerRef.current != null) {
+        window.clearTimeout(initialEndTimerRef.current);
+      }
+      if (rafRef.current != null) {
+        window.cancelAnimationFrame(rafRef.current);
+      }
+    };
+  }, []);
 
   return (
     <div
-      className={`film-col${reverse ? " film-col--reverse" : ""}`}
-      style={{ "--film-duration": `${duration}s` } as CSSProperties}
+      className={[
+        "film-bg-wrap",
+        onItemClick ? "film-bg-wrap--interactive" : "",
+      ]
+        .filter(Boolean)
+        .join(" ")}
+      aria-hidden="true"
     >
-      <div className="film-col-track">
-        {frames.map((f) => (
-          <FilmFrame key={f.key} src={f.url} index={f.index} />
-        ))}
-      </div>
-    </div>
-  );
-}
-
-export function FilmBackground({ items }: { items: Item[] }) {
-  const columnCoverUrls = useMemo(
-    () =>
-      Array.from({ length: COLUMN_COUNT }, (_, i) =>
-        pickColumnCoverUrls(items, i),
-      ),
-    [items],
-  );
-
-  return (
-    <div className="film-bg-wrap" aria-hidden="true">
-      <div className="film-bg">
-        {Array.from({ length: COLUMN_COUNT }, (_, i) => (
-          <FilmColumn key={i} colIndex={i} coverUrls={columnCoverUrls[i]} />
-        ))}
-      </div>
+      <canvas ref={canvasRef} className="film-bg-canvas" />
+      {onItemClick && (
+        <>
+          <div
+            className="film-bg-side-hit film-bg-side-hit--left"
+            onPointerEnter={handlePointerMove}
+            onPointerMove={handlePointerMove}
+            onPointerLeave={handlePointerLeave}
+            onClick={handleSideClick}
+          />
+          <div
+            className="film-bg-side-hit film-bg-side-hit--right"
+            onPointerEnter={handlePointerMove}
+            onPointerMove={handlePointerMove}
+            onPointerLeave={handlePointerLeave}
+            onClick={handleSideClick}
+          />
+        </>
+      )}
       <div className="film-bg-arc" />
     </div>
   );

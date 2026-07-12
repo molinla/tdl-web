@@ -26,8 +26,10 @@ import {
   subscribeEvents,
 } from "./api";
 import { splitIntoColumns } from "./masonry";
-import { FilmBackground } from "./FilmBackground";
+import { registerScrollTarget } from "./scrollNavigation";
+import { FilmBackground, type FilmClickDetail } from "./FilmBackground";
 import { MediaPreview } from "./MediaPreview";
+import { ScrollRail } from "./ScrollRail";
 import { AppSkeleton, StatusBar } from "./StatusBar";
 import type { Item, ItemsPayload, RangeType } from "./types";
 
@@ -35,6 +37,7 @@ type PlayerState =
   | { kind: "video"; item: Item }
   | { kind: "image"; item: Item }
   | null;
+type PreviewTransitionMode = "zoom" | "film-fade";
 
 const masonrySizeCache = new Map<string, number>();
 /** Last measured tile box plus decoded cover ratio keep virtual top estimates stable across remounts. */
@@ -44,6 +47,56 @@ const masonryBoxCache = new Map<
 >();
 const coverAspectCache = new Map<string, number>();
 const VIRTUAL_BUFFER_SCREENS = 2;
+const FILM_BACKGROUND_SETTLE_MS = 180;
+const FILM_BACKGROUND_STAGE_SIZE = 200;
+
+type VirtualWindowEntry = {
+  item: Item;
+  index: number;
+};
+
+function compareTimelineItems(a: Item, b: Item): number {
+  const aDate = a.date && a.date > 0 ? a.date : 0;
+  const bDate = b.date && b.date > 0 ? b.date : 0;
+  if (aDate !== bDate) return bDate - aDate;
+  if (a.message_id !== b.message_id) return b.message_id - a.message_id;
+  return b.logical_pos - a.logical_pos;
+}
+
+function itemIdSignature(items: Item[], sorted = true): string {
+  const ids = items.map((item) => item.id);
+  if (sorted) ids.sort();
+  return ids.join("|");
+}
+
+function uniqueItems(items: Item[]): Item[] {
+  const seen = new Set<string>();
+  const ret: Item[] = [];
+  for (const item of items) {
+    if (seen.has(item.id)) continue;
+    seen.add(item.id);
+    ret.push(item);
+  }
+  return ret;
+}
+
+function stageFromVirtualWindow(entries: VirtualWindowEntry[]): number | null {
+  if (entries.length === 0) return null;
+  const indices = entries
+    .map((entry) => entry.index)
+    .filter((index) => Number.isFinite(index) && index >= 0)
+    .sort((a, b) => a - b);
+
+  const median = indices[Math.floor(indices.length / 2)];
+  if (median == null) return null;
+  return Math.floor(median / FILM_BACKGROUND_STAGE_SIZE);
+}
+
+function stageItems(items: Item[], stage: number | null): Item[] {
+  if (stage == null || stage < 0) return [];
+  const start = stage * FILM_BACKGROUND_STAGE_SIZE;
+  return items.slice(start, start + FILM_BACKGROUND_STAGE_SIZE);
+}
 
 const viewportBufferSubs = new Set<() => void>();
 let viewportBufferPx =
@@ -213,19 +266,23 @@ function estimateMasonryItemSize(
 }
 
 function MasonryColumn({
+  colIndex,
   items,
   gap,
   estimateSize,
   columnWidth,
   scrollMargin,
   renderItem,
+  onVirtualItemsChange,
 }: {
+  colIndex: number;
   items: Item[];
   gap: number;
   estimateSize: number;
   columnWidth: number;
   scrollMargin: number;
   renderItem: (item: Item) => ReactNode;
+  onVirtualItemsChange?: (colIndex: number, items: Item[]) => void;
 }) {
   const overscan = useVirtualOverscan(estimateSize, gap);
   const getItemKey = useCallback((index: number) => {
@@ -285,6 +342,33 @@ function MasonryColumn({
     virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
   }, [virtualizer]);
 
+  const virtualItems = virtualizer.getVirtualItems();
+  const virtualItemSignature = virtualItems.map((item) => item.index).join("|");
+
+  useEffect(() => {
+    if (!onVirtualItemsChange) return;
+    onVirtualItemsChange(
+      colIndex,
+      virtualItems
+        .map((vItem) => items[vItem.index])
+        .filter((item): item is Item => item != null),
+    );
+  }, [colIndex, items, onVirtualItemsChange, virtualItemSignature]);
+
+  useEffect(() => {
+    const unsubs = items.map((item, index) =>
+      registerScrollTarget(item.id, () => {
+        virtualizer.scrollToIndex(index, {
+          align: "center",
+          behavior: "smooth",
+        });
+      }),
+    );
+    return () => {
+      for (const unsub of unsubs) unsub();
+    };
+  }, [items, virtualizer]);
+
   if (items.length === 0) return <div className="masonry-col" />;
 
   return (
@@ -292,7 +376,7 @@ function MasonryColumn({
       className="masonry-col"
       style={{ height: virtualizer.getTotalSize(), position: "relative" }}
     >
-      {virtualizer.getVirtualItems().map((vItem) => {
+      {virtualItems.map((vItem) => {
         const item = items[vItem.index];
         if (!item) return null;
         return (
@@ -324,6 +408,7 @@ function VirtualMasonry({
   estimateSize,
   renderItem,
   className,
+  onVirtualItemsChange,
 }: {
   items: Item[];
   minColumnWidth: number;
@@ -331,6 +416,7 @@ function VirtualMasonry({
   estimateSize: number;
   renderItem: (item: Item) => ReactNode;
   className?: string;
+  onVirtualItemsChange?: (entries: VirtualWindowEntry[]) => void;
 }) {
   const { ref, columns, columnWidth } = useColumnCount(minColumnWidth, gap);
   const buckets = useMemo(
@@ -338,6 +424,67 @@ function VirtualMasonry({
     [items, columns],
   );
   const scrollMargin = useScrollMargin(ref, items.length, columns, gap);
+  const sourceOrder = useMemo(() => {
+    const order = new Map<string, number>();
+    items.forEach((item, index) => order.set(item.id, index));
+    return order;
+  }, [items]);
+  const layoutSignature = useMemo(
+    () => `${columns}:${itemIdSignature(items, false)}`,
+    [columns, items],
+  );
+  const virtualItemsByColumnRef = useRef(new Map<number, Item[]>());
+  const columnVirtualSignatureRef = useRef(new Map<number, string>());
+  const layoutSignatureRef = useRef(layoutSignature);
+  const combinedVirtualSignatureRef = useRef("");
+
+  const handleColumnVirtualItemsChange = useCallback(
+    (colIndex: number, colItems: Item[]) => {
+      if (layoutSignatureRef.current !== layoutSignature) {
+        layoutSignatureRef.current = layoutSignature;
+        virtualItemsByColumnRef.current.clear();
+        columnVirtualSignatureRef.current.clear();
+        combinedVirtualSignatureRef.current = "";
+      }
+
+      const columnSignature = itemIdSignature(colItems, false);
+      if (columnVirtualSignatureRef.current.get(colIndex) === columnSignature) {
+        return;
+      }
+
+      virtualItemsByColumnRef.current.set(colIndex, colItems);
+      columnVirtualSignatureRef.current.set(colIndex, columnSignature);
+
+      for (const key of virtualItemsByColumnRef.current.keys()) {
+        if (key >= columns) {
+          virtualItemsByColumnRef.current.delete(key);
+          columnVirtualSignatureRef.current.delete(key);
+        }
+      }
+
+      const combinedEntries: VirtualWindowEntry[] = [];
+      const seen = new Set<string>();
+      for (let i = 0; i < columns; i += 1) {
+        for (const item of virtualItemsByColumnRef.current.get(i) ?? []) {
+          if (seen.has(item.id)) continue;
+          seen.add(item.id);
+          combinedEntries.push({
+            item,
+            index: sourceOrder.get(item.id) ?? 0,
+          });
+        }
+      }
+      combinedEntries.sort((a, b) => a.index - b.index);
+
+      const combinedSignature = combinedEntries
+        .map((entry) => `${entry.index}:${entry.item.id}`)
+        .join("|");
+      if (combinedVirtualSignatureRef.current === combinedSignature) return;
+      combinedVirtualSignatureRef.current = combinedSignature;
+      onVirtualItemsChange?.(combinedEntries);
+    },
+    [columns, layoutSignature, onVirtualItemsChange, sourceOrder],
+  );
 
   const style = { "--masonry-gap": `${gap}px` } as CSSProperties;
 
@@ -347,12 +494,14 @@ function VirtualMasonry({
         {buckets.map((colItems, colIndex) => (
           <MasonryColumn
             key={colIndex}
+            colIndex={colIndex}
             items={colItems}
             gap={gap}
             estimateSize={estimateSize}
             columnWidth={columnWidth}
             scrollMargin={scrollMargin}
             renderItem={renderItem}
+            onVirtualItemsChange={handleColumnVirtualItemsChange}
           />
         ))}
       </div>
@@ -725,7 +874,12 @@ export default function App() {
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [player, setPlayer] = useState<PlayerState>(null);
-  const [previewOrigin, setPreviewOrigin] = useState<DOMRect | null>(null);
+  const [previewOrigin, setPreviewOrigin] = useState<DOMRectReadOnly | null>(
+    null,
+  );
+  const [previewOriginRotation, setPreviewOriginRotation] = useState(0);
+  const [previewTransitionMode, setPreviewTransitionMode] =
+    useState<PreviewTransitionMode>("zoom");
   const [previewClosing, setPreviewClosing] = useState(false);
   const [playError, setPlayError] = useState("");
 
@@ -735,7 +889,6 @@ export default function App() {
     else set.delete(id);
     setCoverLoadingCount(set.size);
   }, []);
-
   const applyPayload = (payload: ItemsPayload) => {
     setItems(payload.items ?? []);
     setImporting(payload.importing);
@@ -775,7 +928,10 @@ export default function App() {
     };
   }, []);
 
-  const displayItems = useMemo(() => [...items].reverse(), [items]);
+  const displayItems = useMemo(
+    () => [...items].sort(compareTimelineItems),
+    [items],
+  );
   const videos = useMemo(
     () => displayItems.filter((i) => i.type === "video"),
     [displayItems],
@@ -789,7 +945,82 @@ export default function App() {
     [displayItems],
   );
   const mediaItems = useMemo(() => [...videos, ...images], [videos, images]);
+  const [viewportBackgroundItems, setViewportBackgroundItems] = useState<Item[]>(
+    [],
+  );
+  const pendingVideoBackgroundStageRef = useRef<number | null>(null);
+  const pendingImageBackgroundStageRef = useRef<number | null>(null);
+  const backgroundSettleTimerRef = useRef<number | null>(null);
+  const backgroundStageKeyRef = useRef("");
   const done = items.filter((i) => i.status === "completed").length;
+
+  const scheduleBackgroundItemsUpdate = useCallback(() => {
+    if (backgroundSettleTimerRef.current != null) {
+      window.clearTimeout(backgroundSettleTimerRef.current);
+    }
+    backgroundSettleTimerRef.current = window.setTimeout(() => {
+      backgroundSettleTimerRef.current = null;
+      const videoStage = pendingVideoBackgroundStageRef.current;
+      const imageStage = pendingImageBackgroundStageRef.current;
+      const videoItems = stageItems(videos, videoStage);
+      const imageItems = stageItems(images, imageStage);
+      const next = uniqueItems([...videoItems, ...imageItems]);
+      if (next.length === 0) return;
+
+      const stageKey = [
+        videoItems.length > 0 && videoStage != null ? `video:${videoStage}` : "",
+        imageItems.length > 0 && imageStage != null ? `image:${imageStage}` : "",
+      ]
+        .filter(Boolean)
+        .join("|");
+      if (!stageKey || stageKey === backgroundStageKeyRef.current) return;
+      backgroundStageKeyRef.current = stageKey;
+      setViewportBackgroundItems(next);
+    }, FILM_BACKGROUND_SETTLE_MS);
+  }, [images, videos]);
+
+  const handleVideoVirtualItemsChange = useCallback(
+    (entries: VirtualWindowEntry[]) => {
+      const stage = stageFromVirtualWindow(entries);
+      if (stage == null || pendingVideoBackgroundStageRef.current === stage) {
+        return;
+      }
+      pendingVideoBackgroundStageRef.current = stage;
+      scheduleBackgroundItemsUpdate();
+    },
+    [scheduleBackgroundItemsUpdate],
+  );
+
+  const handleImageVirtualItemsChange = useCallback(
+    (entries: VirtualWindowEntry[]) => {
+      const stage = stageFromVirtualWindow(entries);
+      if (stage == null || pendingImageBackgroundStageRef.current === stage) {
+        return;
+      }
+      pendingImageBackgroundStageRef.current = stage;
+      scheduleBackgroundItemsUpdate();
+    },
+    [scheduleBackgroundItemsUpdate],
+  );
+
+  useEffect(() => {
+    return () => {
+      if (backgroundSettleTimerRef.current != null) {
+        window.clearTimeout(backgroundSettleTimerRef.current);
+      }
+    };
+  }, []);
+
+  const effectiveBackgroundItems = useMemo(() => {
+    if (viewportBackgroundItems.length === 0) return mediaItems;
+
+    const freshById = new Map(mediaItems.map((item) => [item.id, item]));
+    const freshViewportItems = viewportBackgroundItems
+      .map((item) => freshById.get(item.id))
+      .filter((item): item is Item => item != null);
+
+    return freshViewportItems.length > 0 ? freshViewportItems : mediaItems;
+  }, [mediaItems, viewportBackgroundItems]);
   const livePlayer = useMemo(() => {
     if (!player) return null;
     const fresh = items.find((i) => i.id === player.item.id);
@@ -855,14 +1086,37 @@ export default function App() {
     );
   }
 
+  function getPreviewRotation(target: HTMLElement): number {
+    const el = target.closest("[data-preview-rotation]") as HTMLElement | null;
+    const rotation = Number(el?.dataset.previewRotation ?? 0);
+    return Number.isFinite(rotation) ? rotation : 0;
+  }
+
   function openPlayer(
     kind: "video" | "image",
     item: Item,
     target: HTMLElement,
+    transitionMode: PreviewTransitionMode = "zoom",
   ) {
     setPlayError("");
     setPreviewClosing(false);
+    setPreviewTransitionMode(transitionMode);
     setPreviewOrigin(getPreviewSourceEl(target).getBoundingClientRect());
+    setPreviewOriginRotation(getPreviewRotation(target));
+    setPlayer({ kind, item });
+  }
+
+  function openPlayerFromRect(
+    kind: "video" | "image",
+    item: Item,
+    originRect: DOMRectReadOnly,
+    transitionMode: PreviewTransitionMode = "zoom",
+  ) {
+    setPlayError("");
+    setPreviewClosing(false);
+    setPreviewTransitionMode(transitionMode);
+    setPreviewOrigin(originRect);
+    setPreviewOriginRotation(0);
     setPlayer({ kind, item });
   }
 
@@ -870,28 +1124,40 @@ export default function App() {
     setPreviewClosing(true);
   }
 
-  async function finalizeClosePlayer() {
-    const current = livePlayer;
+  function finalizeClosePlayer() {
     setPlayer(null);
     setPreviewOrigin(null);
+    setPreviewOriginRotation(0);
+    setPreviewTransitionMode("zoom");
     setPreviewClosing(false);
     setPlayError("");
-    if (current?.kind === "video" && current.item.status === "caching") {
-      try {
-        await pauseItem(current.item.id);
-      } catch (err) {
-        setError(err instanceof Error ? err.message : String(err));
-      }
-    }
+  }
+
+  function openFilmPlayer({ item, originRect }: FilmClickDetail) {
+    openPlayerFromRect(
+      item.type === "image" ? "image" : "video",
+      item,
+      originRect,
+      "film-fade",
+    );
   }
 
   return (
     <>
-      {apiReady && mediaItems.length > 0 && (
-        <FilmBackground items={mediaItems} />
+      {apiReady && effectiveBackgroundItems.length > 0 && (
+        <FilmBackground
+          items={effectiveBackgroundItems}
+          onItemClick={openFilmPlayer}
+        />
       )}
-      {!(livePlayer?.kind === "video" && !previewClosing) && (
-      <header className="topbar">
+      <header
+        className={[
+          "topbar",
+          livePlayer && !previewClosing ? "topbar--collapsed" : "",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
         <div className="topbar-inner">
           <div className="brand">
             tdl <span>PREVIEW</span>
@@ -901,7 +1167,6 @@ export default function App() {
           </div>
         </div>
       </header>
-      )}
       <div className="app">
 
       <StatusBar
@@ -980,7 +1245,15 @@ export default function App() {
         <AppSkeleton />
       ) : (
         <>
-      <section className="section">
+      {apiReady && (
+        <ScrollRail
+          collapsed={Boolean(livePlayer && !previewClosing)}
+          videos={videos}
+          images={images}
+          files={files}
+        />
+      )}
+      <section id="section-videos" className="section">
         <h2>Videos</h2>
         {videos.length === 0 ? (
           <div className="empty">
@@ -993,8 +1266,13 @@ export default function App() {
             minColumnWidth={280}
             gap={16}
             estimateSize={320}
+            onVirtualItemsChange={handleVideoVirtualItemsChange}
             renderItem={(item) => (
-              <div className="card-wrap">
+              <div
+                className="card-wrap"
+                id={`scroll-item-${item.id}`}
+                data-scroll-item={item.id}
+              >
                 <button
                   type="button"
                   className="card"
@@ -1047,7 +1325,7 @@ export default function App() {
         )}
       </section>
 
-      <section className="section">
+      <section id="section-images" className="section">
         <h2>Images</h2>
         {images.length === 0 ? (
           <div className="empty">
@@ -1060,10 +1338,13 @@ export default function App() {
             minColumnWidth={160}
             gap={12}
             estimateSize={200}
+            onVirtualItemsChange={handleImageVirtualItemsChange}
             renderItem={(item) => (
               <button
                 type="button"
                 className="image-tile"
+                id={`scroll-item-${item.id}`}
+                data-scroll-item={item.id}
                 onClick={(e) => openPlayer("image", item, e.currentTarget)}
                 title={`${displayName(item)} · ${statusLabel(item)}${
                   item.date ? ` · ${formatMessageDate(item.date)}` : ""
@@ -1087,14 +1368,19 @@ export default function App() {
         )}
       </section>
 
-      <section className="section">
+      <section id="section-files" className="section">
         <h2>Files</h2>
         {files.length === 0 ? (
           <div className="empty">暂无压缩包或其它文件。</div>
         ) : (
           <div className="file-list">
             {files.map((item) => (
-              <div key={item.id} className="file-row">
+              <div
+                key={item.id}
+                id={`scroll-item-${item.id}`}
+                data-scroll-item={item.id}
+                className="file-row"
+              >
                 <div>
                   <strong>{displayName(item)}</strong>
                   <div className="muted">
@@ -1145,6 +1431,8 @@ export default function App() {
         <MediaPreview
           player={livePlayer}
           originRect={previewOrigin}
+          originRotation={previewOriginRotation}
+          transitionMode={previewTransitionMode}
           thumbSrc={coverURL(
             livePlayer.item.cover ||
               livePlayer.item.thumb_url ||
@@ -1155,7 +1443,7 @@ export default function App() {
           playError={playError}
           onPlayError={setPlayError}
           onCloseRequest={requestClosePlayer}
-          onClosed={() => void finalizeClosePlayer()}
+          onClosed={finalizeClosePlayer}
           onPause={onPause}
         />
       )}

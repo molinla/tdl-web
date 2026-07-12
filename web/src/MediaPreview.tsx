@@ -7,27 +7,21 @@ import {
 } from "react";
 import {
   displayName,
-  formatDuration,
-  formatMessageDate,
-  formatSize,
   mediaURL,
   probeMediaError,
   progressPct,
-  statusLabel,
 } from "./api";
 import type { Item } from "./types";
 
 const TRANSITION_MS = 450;
+const FILM_FADE_TRANSITION_MS = 320;
 
 type PlayerState = { kind: "video"; item: Item } | { kind: "image"; item: Item };
+type PreviewTransitionMode = "zoom" | "film-fade";
 
 type Box = { top: number; left: number; width: number; height: number };
 
 type Layout = {
-  panelLeft: number;
-  panelTop: number;
-  panelWidth: number;
-  panelHeight: number;
   media: Box;
 };
 
@@ -35,40 +29,8 @@ function defaultAspect(kind: PlayerState["kind"]) {
   return kind === "video" ? 9 / 16 : 4 / 3;
 }
 
-function computeImageLayout(aspectHeightPerWidth: number): Layout {
-  const pad = 24;
-  const headH = 52;
-  const footH = 48;
-  const panelWidth = Math.min(960, window.innerWidth - pad * 2);
-  const maxMediaH = Math.max(180, window.innerHeight * 0.68 - headH - footH);
-
-  let mediaW = panelWidth;
-  let mediaH = mediaW * aspectHeightPerWidth;
-  if (mediaH > maxMediaH) {
-    mediaH = maxMediaH;
-    mediaW = mediaH / aspectHeightPerWidth;
-  }
-
-  const panelHeight = headH + mediaH + footH;
-  const panelLeft = (window.innerWidth - panelWidth) / 2;
-  const panelTop = (window.innerHeight - panelHeight) / 2;
-
-  return {
-    panelLeft,
-    panelTop,
-    panelWidth,
-    panelHeight,
-    media: {
-      top: panelTop + headH,
-      left: panelLeft + (panelWidth - mediaW) / 2,
-      width: mediaW,
-      height: mediaH,
-    },
-  };
-}
-
-/** Immersive video: one black stage sized to aspect, no outer panel chrome. */
-function computeVideoLayout(aspectHeightPerWidth: number): Layout {
+/** Immersive stage: one black canvas sized to aspect, no outer panel chrome. */
+function computeImmersiveLayout(aspectHeightPerWidth: number): Layout {
   const pad = 16;
   const maxW = window.innerWidth - pad * 2;
   const maxH = window.innerHeight - pad * 2;
@@ -84,22 +46,15 @@ function computeVideoLayout(aspectHeightPerWidth: number): Layout {
   const top = (window.innerHeight - height) / 2;
 
   return {
-    panelLeft: left,
-    panelTop: top,
-    panelWidth: width,
-    panelHeight: height,
     media: { top, left, width, height },
   };
 }
 
 function computeLayout(
-  kind: PlayerState["kind"],
+  _kind: PlayerState["kind"],
   aspectHeightPerWidth: number,
 ): Layout {
-  if (kind === "video") {
-    return computeVideoLayout(aspectHeightPerWidth);
-  }
-  return computeImageLayout(aspectHeightPerWidth);
+  return computeImmersiveLayout(aspectHeightPerWidth);
 }
 
 function rectToBox(rect: DOMRectReadOnly): Box {
@@ -119,12 +74,13 @@ function resolveOriginRect(itemId: string, fallback: Box): Box {
   return rectToBox(el.getBoundingClientRect());
 }
 
-function boxStyle(box: Box): CSSProperties {
+function boxStyle(box: Box, rotation = 0): CSSProperties {
   return {
     top: `${box.top}px`,
     left: `${box.left}px`,
     width: `${box.width}px`,
     height: `${box.height}px`,
+    transform: `rotate(${rotation}deg)`,
   };
 }
 
@@ -235,6 +191,8 @@ function PreviewCloseIcon() {
 export function MediaPreview({
   player,
   originRect,
+  originRotation,
+  transitionMode = "zoom",
   thumbSrc,
   aspectRatio,
   closing,
@@ -246,6 +204,8 @@ export function MediaPreview({
 }: {
   player: PlayerState;
   originRect: DOMRectReadOnly;
+  originRotation: number;
+  transitionMode?: PreviewTransitionMode;
   thumbSrc: string;
   aspectRatio?: number;
   closing: boolean;
@@ -256,14 +216,9 @@ export function MediaPreview({
   onPause: (item: Item) => void;
 }) {
   const originBox = useRef<Box>(rectToBox(originRect));
+  const originRotationRef = useRef(originRotation);
   const [phase, setPhase] = useState<"entering" | "open" | "leaving">(
     "entering",
-  );
-  const [layout, setLayout] = useState<Layout>(() =>
-    computeLayout(
-      player.kind,
-      aspectRatio ?? defaultAspect(player.kind),
-    ),
   );
   const [mediaBox, setMediaBox] = useState<Box>(originBox.current);
   const [chromeVisible, setChromeVisible] = useState(false);
@@ -279,21 +234,42 @@ export function MediaPreview({
   const videoRef = useRef<HTMLVideoElement>(null);
 
   const aspect = aspectRatio ?? defaultAspect(player.kind);
+  const isFilmFade = transitionMode === "film-fade";
+  const transitionMs = isFilmFade ? FILM_FADE_TRANSITION_MS : TRANSITION_MS;
 
   useLayoutEffect(() => {
     originBox.current = rectToBox(originRect);
+    originRotationRef.current = originRotation;
     const nextLayout = computeLayout(player.kind, aspect);
-    setLayout(nextLayout);
+
+    if (isFilmFade) {
+      setMediaBox(nextLayout.media);
+      setPhase("entering");
+      setChromeVisible(false);
+      setShowVideo(player.kind === "video");
+      setVideoReady(false);
+
+      if (reducedMotion.current) {
+        setPhase("open");
+        setChromeVisible(true);
+        return;
+      }
+
+      const id = window.requestAnimationFrame(() => {
+        setPhase("open");
+      });
+      return () => window.cancelAnimationFrame(id);
+    }
+
+    setMediaBox(reducedMotion.current ? nextLayout.media : originBox.current);
 
     if (reducedMotion.current) {
-      setMediaBox(nextLayout.media);
       setPhase("open");
       setChromeVisible(true);
       if (player.kind === "video") setShowVideo(true);
       return;
     }
 
-    setMediaBox(originBox.current);
     setPhase("entering");
     setChromeVisible(false);
     setShowVideo(false);
@@ -306,7 +282,22 @@ export function MediaPreview({
       });
     });
     return () => window.cancelAnimationFrame(id);
-  }, [player.item.id, player.kind, originRect, aspect]);
+  }, [
+    player.item.id,
+    player.kind,
+    originRect,
+    originRotation,
+    aspect,
+    isFilmFade,
+  ]);
+
+  useEffect(() => {
+    const root = document.documentElement;
+    root.classList.add("body-scroll-locked");
+    return () => {
+      root.classList.remove("body-scroll-locked");
+    };
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -321,24 +312,40 @@ export function MediaPreview({
 
     closeHandledRef.current = false;
     videoRef.current?.pause();
-    setVideoReady(false);
     setChromeVisible(false);
     setPhase("leaving");
-    setMediaBox(resolveOriginRect(player.item.id, originBox.current));
+
+    if (isFilmFade) {
+      const targetBox = computeLayout(player.kind, aspect).media;
+      setMediaBox(targetBox);
+      if (reducedMotion.current) {
+        onClosedRef.current();
+        return;
+      }
+      const t = window.setTimeout(() => {
+        if (closeHandledRef.current) return;
+        closeHandledRef.current = true;
+        onClosedRef.current();
+      }, transitionMs);
+      return () => window.clearTimeout(t);
+    }
+
+    {
+      setMediaBox(resolveOriginRect(player.item.id, originBox.current));
+    }
 
     if (reducedMotion.current) {
       onClosedRef.current();
       return;
     }
 
-    const waitMs = TRANSITION_MS;
     const t = window.setTimeout(() => {
       if (closeHandledRef.current) return;
       closeHandledRef.current = true;
       onClosedRef.current();
-    }, waitMs);
+    }, transitionMs);
     return () => window.clearTimeout(t);
-  }, [closing, player.item.id, player.kind]);
+  }, [aspect, closing, isFilmFade, player.item.id, player.kind, transitionMs]);
 
   useEffect(() => {
     if (phase !== "open") return;
@@ -347,17 +354,15 @@ export function MediaPreview({
     }
     const t = window.setTimeout(
       () => setChromeVisible(true),
-      reducedMotion.current ? 0 : TRANSITION_MS * 0.55,
+      reducedMotion.current || isFilmFade ? 0 : transitionMs * 0.55,
     );
     return () => window.clearTimeout(t);
-  }, [phase, player.kind]);
+  }, [isFilmFade, phase, player.kind, transitionMs]);
 
   useEffect(() => {
     const onResize = () => {
       if (phase !== "open") return;
-      const nextLayout = computeLayout(player.kind, aspect);
-      setLayout(nextLayout);
-      setMediaBox(nextLayout.media);
+      setMediaBox(computeLayout(player.kind, aspect).media);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
@@ -365,22 +370,25 @@ export function MediaPreview({
 
   function handleMediaTransitionEnd(e: React.TransitionEvent) {
     if (phase !== "leaving" || closeHandledRef.current) return;
+    if (isFilmFade) return;
     if (e.propertyName !== "width" && e.propertyName !== "top") return;
-    if (player.kind === "video") return;
     closeHandledRef.current = true;
     onClosedRef.current();
   }
 
   const item = player.item;
   const isOpen = phase === "open";
+  const rootOpen = isOpen || phase === "leaving" || isFilmFade;
   const showVideoPlayer =
-    player.kind === "video" && (showVideo || phase === "leaving");
+    player.kind === "video" && (showVideo || phase === "leaving" || isFilmFade);
 
   return (
     <div
       className={[
         "preview-root",
-        isOpen || phase === "leaving" ? "preview-root--open" : "",
+        rootOpen ? "preview-root--open" : "",
+        "preview-root--immersive",
+        isFilmFade ? "preview-root--film-fade" : "",
         player.kind === "video" ? "preview-root--video" : "preview-root--image",
       ]
         .filter(Boolean)
@@ -390,7 +398,7 @@ export function MediaPreview({
         type="button"
         className={[
           "preview-backdrop",
-          isOpen ? "preview-backdrop--open" : "",
+          rootOpen && phase !== "leaving" ? "preview-backdrop--open" : "",
           phase === "leaving" ? "preview-backdrop--leaving" : "",
         ]
           .filter(Boolean)
@@ -402,14 +410,21 @@ export function MediaPreview({
       <div
         className={[
           "preview-media",
-          player.kind === "video" ? "preview-media--video" : "",
+          "preview-media--immersive",
+          isFilmFade ? "preview-media--film-fade" : "",
+          player.kind === "video" ? "preview-media--video" : "preview-media--image",
           isOpen ? "preview-media--open" : "",
           phase === "leaving" ? "preview-media--leaving" : "",
-          videoReady && phase === "open" ? "preview-media--video-ready" : "",
+          videoReady && (phase === "open" || phase === "leaving")
+            ? "preview-media--video-ready"
+            : "",
         ]
           .filter(Boolean)
           .join(" ")}
-        style={boxStyle(mediaBox)}
+        style={boxStyle(
+          mediaBox,
+          isFilmFade || phase === "open" ? 0 : originRotationRef.current,
+        )}
         onTransitionEnd={handleMediaTransitionEnd}
       >
         {player.kind === "video" ? (
@@ -462,92 +477,39 @@ export function MediaPreview({
         )}
       </div>
 
-      {player.kind === "video" && chromeVisible && (
-        <>
-          <div className="preview-video-actions">
-            {(item.status === "caching" || item.status === "paused") && (
-              <RingProgressButton
-                pct={progressPct(item)}
-                label={
-                  item.status === "caching"
-                    ? `下载中 ${progressPct(item)}%，点击暂停`
-                    : `已暂停 ${progressPct(item)}%`
-                }
-                interactive={item.status === "caching"}
-                onClick={
-                  item.status === "caching" ? () => onPause(item) : undefined
-                }
-              />
-            )}
-            <button
-              type="button"
-              className="preview-icon-btn"
-              onClick={onCloseRequest}
-              aria-label="关闭"
-            >
-              <PreviewCloseIcon />
-            </button>
-          </div>
-          {playError && (
-            <div className="preview-global-error banner error">{playError}</div>
-          )}
-        </>
-      )}
-
-      {player.kind === "image" && (
-        <div
-          className={[
-            "preview-panel",
-            chromeVisible ? "preview-panel--visible" : "",
-          ]
-            .filter(Boolean)
-            .join(" ")}
-          style={
-            {
-              top: `${layout.panelTop}px`,
-              left: `${layout.panelLeft}px`,
-              width: `${layout.panelWidth}px`,
-              height: `${layout.panelHeight}px`,
-            } as CSSProperties
-          }
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div className="preview-head">
-            <h3>{displayName(item)}</h3>
-            <div className="modal-actions">
-              <button className="btn ghost" onClick={onCloseRequest}>
-                关闭
-              </button>
-            </div>
-          </div>
-          <div
-            className="preview-media-slot"
-            style={boxStyle({
-              top: layout.media.top - layout.panelTop,
-              left: layout.media.left - layout.panelLeft,
-              width: layout.media.width,
-              height: layout.media.height,
-            })}
-            aria-hidden="true"
+      <div
+        className={[
+          "preview-video-actions",
+          chromeVisible ? "" : "preview-video-actions--collapsed",
+        ]
+          .filter(Boolean)
+          .join(" ")}
+      >
+        {(item.status === "caching" || item.status === "paused") && (
+          <RingProgressButton
+            pct={progressPct(item)}
+            label={
+              item.status === "caching"
+                ? `下载中 ${progressPct(item)}%，点击暂停`
+                : `已暂停 ${progressPct(item)}%`
+            }
+            interactive={item.status === "caching"}
+            onClick={
+              item.status === "caching" ? () => onPause(item) : undefined
+            }
           />
-          <div className="preview-foot">
-            <span>
-              {[
-                formatMessageDate(item.date),
-                formatSize(item.size),
-                item.duration ? formatDuration(item.duration) : "",
-              ]
-                .filter(Boolean)
-                .join(" · ")}
-            </span>
-            <span>
-              {playError && item.status === "error"
-                ? "错误"
-                : statusLabel(item)}
-            </span>
-          </div>
-          {playError && <div className="banner error">{playError}</div>}
-        </div>
+        )}
+        <button
+          type="button"
+          className="preview-icon-btn"
+          onClick={onCloseRequest}
+          aria-label="关闭"
+        >
+          <PreviewCloseIcon />
+        </button>
+      </div>
+      {chromeVisible && playError && (
+        <div className="preview-global-error banner error">{playError}</div>
       )}
     </div>
   );
