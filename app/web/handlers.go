@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -186,7 +187,7 @@ func (s *Server) handleDownload(ctx context.Context) http.HandlerFunc {
 			}
 			s.mu.RUnlock()
 		}
-		s.enqueueDownloads(ctx, req.IDs)
+		s.enqueueDownloadsExplicit(ctx, req.IDs)
 		writeJSON(w, map[string]any{"ok": true})
 	}
 }
@@ -453,6 +454,10 @@ func (s *Server) handleStream(ctx context.Context) http.HandlerFunc {
 			serveLocalFile(w, r, f, filepath.Base(target), mime)
 			return
 		}
+		if serveTmpRange(w, r, target+tempExt, mime, item.Size) {
+			s.startDownloadNow(id)
+			return
+		}
 
 		resolved, err := s.ensureMedia(ctx, id)
 		if err != nil {
@@ -476,6 +481,70 @@ func (s *Server) handleStream(ctx context.Context) http.HandlerFunc {
 		defer release()
 		s.serveTelegramMedia(ctx, resolved.media, w, r, true)
 	}
+}
+
+func serveTmpRange(w http.ResponseWriter, r *http.Request, tmpPath, mime string, fullSize int64) bool {
+	if fullSize <= 0 || r.Header.Get("Range") == "" {
+		return false
+	}
+	f, err := os.Open(tmpPath)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil || st.Size() <= 0 {
+		return false
+	}
+	start, end, ok := parseTmpRange(r.Header.Get("Range"), st.Size(), fullSize)
+	if !ok {
+		return false
+	}
+	if _, err := f.Seek(start, io.SeekStart); err != nil {
+		return false
+	}
+	n := end - start + 1
+	if mime != "" {
+		w.Header().Set("Content-Type", mime)
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fullSize))
+	w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
+	w.WriteHeader(http.StatusPartialContent)
+	if r.Method == http.MethodHead {
+		return true
+	}
+	_, _ = io.CopyN(w, f, n)
+	return true
+}
+
+func parseTmpRange(header string, tmpSize, fullSize int64) (int64, int64, bool) {
+	if tmpSize <= 0 || fullSize <= 0 || !strings.HasPrefix(header, "bytes=") || strings.Contains(header, ",") {
+		return 0, 0, false
+	}
+	parts := strings.SplitN(strings.TrimPrefix(header, "bytes="), "-", 2)
+	if len(parts) != 2 || parts[0] == "" {
+		return 0, 0, false
+	}
+	start, err := strconv.ParseInt(parts[0], 10, 64)
+	if err != nil || start < 0 || start >= tmpSize || start >= fullSize {
+		return 0, 0, false
+	}
+	end := tmpSize - 1
+	if parts[1] != "" {
+		parsedEnd, err := strconv.ParseInt(parts[1], 10, 64)
+		if err != nil || parsedEnd < start {
+			return 0, 0, false
+		}
+		if parsedEnd < end {
+			end = parsedEnd
+		}
+	}
+	if fullSize-1 < end {
+		end = fullSize - 1
+	}
+	return start, end, start <= end
 }
 
 func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {

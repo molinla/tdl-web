@@ -59,6 +59,8 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		items:        map[string]*Item{},
 		finished:     map[int]struct{}{},
 		downloading:  map[string]struct{}{},
+		dlPriority:   map[string]bool{},
+		preempted:    map[string]struct{}{},
 		cancels:      map[string]context.CancelFunc{},
 		events:       make(chan struct{}, 1),
 		importPhase:  phaseIdle,

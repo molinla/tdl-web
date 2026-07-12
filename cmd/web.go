@@ -5,7 +5,9 @@ import (
 	"fmt"
 	"math"
 	"net"
+	"os"
 	"strings"
+	"time"
 
 	"github.com/gotd/td/telegram"
 	"github.com/spf13/cobra"
@@ -31,6 +33,7 @@ func NewWeb() *cobra.Command {
 			if err := validateWebListen(opts.Addr, opts.WebToken); err != nil {
 				return err
 			}
+			applyWebReconnectDefault(cmd)
 			opts.Template = viper.GetString(consts.FlagDlTemplate)
 			if err := applyWebRange(&opts, input); err != nil {
 				return err
@@ -65,6 +68,21 @@ func NewWeb() *cobra.Command {
 	_ = cmd.MarkFlagDirname("dir")
 	_ = cmd.MarkFlagDirname("cache-dir")
 	return cmd
+}
+
+func applyWebReconnectDefault(cmd *cobra.Command) {
+	// The web API is a long-running process. The global default is finite so
+	// one-shot CLI commands do not hang forever, but for web mode that means a
+	// network drop, poor connection, or system sleep after the timeout can stop
+	// the whole API process. Use gotd's infinite reconnection mode by default,
+	// while still respecting explicit CLI/env configuration.
+	if flag := cmd.Root().PersistentFlags().Lookup(consts.FlagReconnectTimeout); flag != nil && flag.Changed {
+		return
+	}
+	if _, ok := os.LookupEnv("TDL_RECONNECT_TIMEOUT"); ok {
+		return
+	}
+	viper.Set(consts.FlagReconnectTimeout, time.Duration(0))
 }
 
 func applyWebRange(opts *appweb.Options, input []int) error {

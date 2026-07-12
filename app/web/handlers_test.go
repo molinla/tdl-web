@@ -9,6 +9,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/gorilla/mux"
 	"github.com/gotd/td/tg"
@@ -119,6 +120,68 @@ func TestHandlePreviewRemoteDoesNotEnqueueDownload(t *testing.T) {
 	}
 	if got := s.pendingDownloadCount(); got != 0 {
 		t.Fatalf("pending downloads=%d, want 0", got)
+	}
+}
+
+func TestHandleStreamUsesTmpRange(t *testing.T) {
+	entered := make(chan struct{})
+	done := make(chan struct{})
+	prevHook := testDownloadHook
+	testDownloadHook = func(ctx context.Context, _ string) error {
+		close(entered)
+		defer close(done)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	defer func() { testDownloadHook = prevHook }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newHandlerTestServer(t)
+	s.ctx = ctx
+
+	id := "partial-video"
+	target := filepath.Join(s.opts.Dir, "video.mp4")
+	if err := os.MkdirAll(filepath.Dir(target), defaultCachePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+tempExt, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.items[id] = &Item{
+		ID:         id,
+		Type:       mediaVideo,
+		Status:     statusPaused,
+		TargetPath: target,
+		MIME:       "video/mp4",
+		Size:       10,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/items/"+id+"/stream", nil)
+	req.Header.Set("Range", "bytes=2-")
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rr := httptest.NewRecorder()
+	s.handleStream(ctx).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Body.String(); got != "cdef" {
+		t.Fatalf("body=%q, want %q", got, "cdef")
+	}
+	if got := rr.Header().Get("Content-Range"); got != "bytes 2-5/10" {
+		t.Fatalf("Content-Range=%q", got)
+	}
+	select {
+	case <-entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("download was not resumed")
+	}
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("download hook did not stop")
 	}
 }
 

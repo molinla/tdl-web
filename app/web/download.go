@@ -52,20 +52,35 @@ func (s *Server) wakeDownloader() {
 // enqueueDownload queues id at the back (background / download-all / images).
 func (s *Server) enqueueDownload(id string) {
 	s.ensureDownloadScheduler()
-	s.queuePush(id, false, true)
+	s.queuePush(id, false, true, true)
+}
+
+func (s *Server) enqueueDownloadBackground(id string) {
+	s.ensureDownloadScheduler()
+	s.queuePush(id, false, true, false)
 }
 
 // startDownloadNow queues id at the front (play / explicit priority).
 func (s *Server) startDownloadNow(id string) {
 	s.ensureDownloadScheduler()
-	s.queuePush(id, true, true)
+	if s.queuePush(id, true, true, true) {
+		s.preemptBackgroundDownload()
+	}
 }
 
 func (s *Server) enqueueDownloads(_ context.Context, ids []string) {
+	s.enqueueDownloadsWithPausePolicy(ids, false)
+}
+
+func (s *Server) enqueueDownloadsExplicit(_ context.Context, ids []string) {
+	s.enqueueDownloadsWithPausePolicy(ids, true)
+}
+
+func (s *Server) enqueueDownloadsWithPausePolicy(ids []string, clearManualPaused bool) {
 	s.ensureDownloadScheduler()
 	changed := false
 	for _, id := range ids {
-		if s.queuePush(id, false, false) {
+		if s.queuePush(id, false, false, clearManualPaused) {
 			changed = true
 		}
 	}
@@ -77,15 +92,18 @@ func (s *Server) enqueueDownloads(_ context.Context, ids []string) {
 
 // queuePush adds id to the wait queue. If doNotify is true, SSE clients are updated.
 // Returns whether the queue changed.
-func (s *Server) queuePush(id string, priority bool, doNotify bool) bool {
+func (s *Server) queuePush(id string, priority bool, doNotify bool, clearManualPaused bool) bool {
 	if id == "" {
 		return false
 	}
-	s.mu.RLock()
+	s.mu.Lock()
 	it := s.items[id]
-	skip := it == nil || it.Status == statusCompleted
+	skip := it == nil || it.Status == statusCompleted || (it.ManualPaused && !clearManualPaused)
 	_, active := s.downloading[id]
-	s.mu.RUnlock()
+	if it != nil && clearManualPaused {
+		it.ManualPaused = false
+	}
+	s.mu.Unlock()
 	if skip || active {
 		return false
 	}
@@ -124,6 +142,35 @@ func (s *Server) queuePush(id string, priority bool, doNotify bool) bool {
 	}
 	s.wakeDownloader()
 	return true
+}
+
+func (s *Server) preemptBackgroundDownload() {
+	s.dlMu.Lock()
+	canPreempt := s.dlActive >= downloadLimit() && s.dlActive > s.dlActivePri
+	s.dlMu.Unlock()
+	if !canPreempt {
+		return
+	}
+
+	var cancel context.CancelFunc
+	s.mu.Lock()
+	for id := range s.downloading {
+		if s.dlPriority[id] {
+			continue
+		}
+		cancel = s.cancels[id]
+		if cancel != nil {
+			if s.preempted == nil {
+				s.preempted = map[string]struct{}{}
+			}
+			s.preempted[id] = struct{}{}
+			break
+		}
+	}
+	s.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
 }
 
 func (s *Server) removeFromQueue(id string) {
@@ -263,7 +310,7 @@ func (s *Server) downloadSchedulerLoop() {
 				s.dlMu.Unlock()
 				s.wakeDownloader()
 			}()
-			s.startDownload(ctx, id)
+			s.startDownload(ctx, id, pri)
 			s.waitDownload(id)
 		}(id, pri)
 	}
@@ -271,7 +318,7 @@ func (s *Server) downloadSchedulerLoop() {
 
 // startDownload begins a single item download without acquiring the global slot.
 // Callers must go through the scheduler (enqueueDownload / startDownloadNow).
-func (s *Server) startDownload(parent context.Context, id string) {
+func (s *Server) startDownload(parent context.Context, id string, priority bool) {
 	if parent == nil {
 		parent = s.ctx
 	}
@@ -293,8 +340,12 @@ func (s *Server) startDownload(parent context.Context, id string) {
 	if s.cancels == nil {
 		s.cancels = map[string]context.CancelFunc{}
 	}
+	if s.dlPriority == nil {
+		s.dlPriority = map[string]bool{}
+	}
 	s.cancels[id] = cancel
 	s.downloading[id] = struct{}{}
+	s.dlPriority[id] = priority
 	item.Status = statusCaching
 	item.Error = ""
 	s.mu.Unlock()
@@ -305,10 +356,19 @@ func (s *Server) startDownload(parent context.Context, id string) {
 		s.mu.Lock()
 		delete(s.downloading, id)
 		delete(s.cancels, id)
+		delete(s.dlPriority, id)
+		_, wasPreempted := s.preempted[id]
+		delete(s.preempted, id)
 		if it := s.items[id]; it != nil {
 			switch {
 			case err == nil:
 				// markCompleted already set status
+			case errors.Is(err, context.Canceled) && wasPreempted:
+				it.Status = statusQueued
+				it.Error = ""
+				if p := tmpProgress(it.TargetPath, it.Size); p > it.Progress {
+					it.Progress = p
+				}
 			case errors.Is(err, context.Canceled):
 				it.Status = statusPaused
 				it.Error = ""
@@ -327,6 +387,9 @@ func (s *Server) startDownload(parent context.Context, id string) {
 		_ = s.saveFinishedOrClear(context.Background())
 		_ = s.saveMetaCache()
 		s.notify()
+		if wasPreempted {
+			s.enqueueDownloadBackground(id)
+		}
 	}()
 }
 
@@ -335,6 +398,10 @@ func (s *Server) pauseDownload(id string) {
 	s.mu.Lock()
 	cancel, active := s.cancels[id]
 	item := s.items[id]
+	if item != nil {
+		item.ManualPaused = true
+	}
+	delete(s.preempted, id)
 	if active {
 		s.mu.Unlock()
 		cancel()
@@ -350,6 +417,7 @@ func (s *Server) pauseDownload(id string) {
 		}
 	}
 	s.mu.Unlock()
+	_ = s.saveMetaCache()
 	s.notify()
 }
 

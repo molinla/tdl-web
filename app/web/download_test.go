@@ -285,6 +285,179 @@ func TestPriorityReserveSlot(t *testing.T) {
 	}
 }
 
+func TestPriorityPreemptsBackgroundDownload(t *testing.T) {
+	prev := viper.GetInt(consts.FlagLimit)
+	viper.Set(consts.FlagLimit, 2)
+	defer viper.Set(consts.FlagLimit, prev)
+
+	gates := map[string]chan struct{}{
+		"bg1":  make(chan struct{}),
+		"bg2":  make(chan struct{}),
+		"play": make(chan struct{}),
+	}
+	entered := make(chan string, 8)
+	canceled := make(chan string, 8)
+
+	prevHook := testDownloadHook
+	testDownloadHook = func(ctx context.Context, id string) error {
+		entered <- id
+		select {
+		case <-gates[id]:
+			return nil
+		case <-ctx.Done():
+			canceled <- id
+			return ctx.Err()
+		}
+	}
+	defer func() { testDownloadHook = prevHook }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := &Server{
+		ctx:         ctx,
+		items:       map[string]*Item{},
+		finished:    map[int]struct{}{},
+		downloading: map[string]struct{}{},
+		cancels:     map[string]context.CancelFunc{},
+		events:      make(chan struct{}, 1),
+	}
+	for i, id := range []string{"bg1", "bg2", "play"} {
+		s.items[id] = &Item{ID: id, Type: mediaVideo, Status: statusQueued, LogicalPos: i, Size: 1}
+		s.order = append(s.order, id)
+	}
+
+	s.enqueueDownloads(ctx, []string{"bg1", "bg2"})
+	seen := map[string]bool{}
+	deadline := time.After(3 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case id := <-entered:
+			seen[id] = true
+		case <-deadline:
+			t.Fatalf("timeout waiting for backgrounds; seen=%v", seen)
+		}
+	}
+
+	s.startDownloadNow("play")
+	select {
+	case id := <-canceled:
+		if id != "bg1" && id != "bg2" {
+			t.Fatalf("canceled %s, want background", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for background preemption")
+	}
+	select {
+	case id := <-entered:
+		if id != "play" {
+			t.Fatalf("started %s after preemption, want play", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timeout waiting for play")
+	}
+
+	for _, g := range gates {
+		select {
+		case <-g:
+		default:
+			close(g)
+		}
+	}
+	deadline = time.After(3 * time.Second)
+	for s.activeDownloadCount() > 0 || s.pendingDownloadCount() > 0 {
+		select {
+		case <-deadline:
+			t.Fatalf("downloads did not finish; active=%d pending=%d",
+				s.activeDownloadCount(), s.pendingDownloadCount())
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+func TestManualPausedDownloadIsNotQueuedByBackground(t *testing.T) {
+	s := &Server{
+		items:       map[string]*Item{},
+		finished:    map[int]struct{}{},
+		downloading: map[string]struct{}{},
+		cancels:     map[string]context.CancelFunc{},
+		events:      make(chan struct{}, 1),
+	}
+	s.items["paused"] = &Item{ID: "paused", Type: mediaVideo, Status: statusPaused, ManualPaused: true}
+
+	if s.queuePush("paused", false, false, false) {
+		t.Fatal("background queue should skip manual paused item")
+	}
+	if !s.queuePush("paused", false, false, true) {
+		t.Fatal("explicit queue should resume manual paused item")
+	}
+	if s.items["paused"].ManualPaused {
+		t.Fatal("explicit queue should clear manual pause")
+	}
+}
+
+func TestEnqueueVideoDownloadsOnlyQueuesEligibleVideos(t *testing.T) {
+	prev := viper.GetInt(consts.FlagLimit)
+	viper.Set(consts.FlagLimit, 2)
+	defer viper.Set(consts.FlagLimit, prev)
+
+	gate := make(chan struct{})
+	entered := make(chan string, 8)
+
+	prevHook := testDownloadHook
+	testDownloadHook = func(ctx context.Context, id string) error {
+		entered <- id
+		select {
+		case <-gate:
+			return nil
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	defer func() { testDownloadHook = prevHook }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	s := &Server{
+		ctx:         ctx,
+		items:       map[string]*Item{},
+		finished:    map[int]struct{}{},
+		downloading: map[string]struct{}{},
+		cancels:     map[string]context.CancelFunc{},
+		events:      make(chan struct{}, 1),
+	}
+	for i, it := range []*Item{
+		{ID: "v1", Type: mediaVideo, Status: statusQueued},
+		{ID: "img", Type: mediaImage, Status: statusQueued},
+		{ID: "done", Type: mediaVideo, Status: statusCompleted},
+		{ID: "manual", Type: mediaVideo, Status: statusPaused, ManualPaused: true},
+		{ID: "v2", Type: mediaVideo, Status: statusQueued},
+	} {
+		it.LogicalPos = i
+		it.Size = 1
+		s.items[it.ID] = it
+		s.order = append(s.order, it.ID)
+	}
+
+	s.enqueueVideoDownloads(ctx)
+	seen := map[string]bool{}
+	deadline := time.After(3 * time.Second)
+	for len(seen) < 2 {
+		select {
+		case id := <-entered:
+			seen[id] = true
+		case <-deadline:
+			t.Fatalf("timeout waiting for eligible videos; seen=%v", seen)
+		}
+	}
+	if !seen["v1"] || !seen["v2"] || seen["img"] || seen["done"] || seen["manual"] {
+		t.Fatalf("queued wrong items: %v", seen)
+	}
+	close(gate)
+}
+
 func TestAlignDown(t *testing.T) {
 	cases := []struct {
 		n, align, want int64

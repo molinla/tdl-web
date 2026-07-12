@@ -21,20 +21,21 @@ type metaCacheFile struct {
 }
 
 type metaCacheItem struct {
-	ID         string `json:"id"`
-	PeerID     int64  `json:"peer_id"`
-	MessageID  int    `json:"message_id"`
-	LogicalPos int    `json:"logical_pos"`
-	RelPath    string `json:"rel_path"`
-	Name       string `json:"name"`
-	MIME       string `json:"mime"`
-	Type       string `json:"type"`
-	Size       int64  `json:"size"`
-	Duration   int    `json:"duration,omitempty"`
-	Date       int64  `json:"date,omitempty"`
-	Status     string `json:"status,omitempty"`
-	Error      string `json:"error,omitempty"`
-	Progress   int64  `json:"progress,omitempty"`
+	ID           string `json:"id"`
+	PeerID       int64  `json:"peer_id"`
+	MessageID    int    `json:"message_id"`
+	LogicalPos   int    `json:"logical_pos"`
+	RelPath      string `json:"rel_path"`
+	Name         string `json:"name"`
+	MIME         string `json:"mime"`
+	Type         string `json:"type"`
+	Size         int64  `json:"size"`
+	Duration     int    `json:"duration,omitempty"`
+	Date         int64  `json:"date,omitempty"`
+	Status       string `json:"status,omitempty"`
+	Error        string `json:"error,omitempty"`
+	Progress     int64  `json:"progress,omitempty"`
+	ManualPaused bool   `json:"manual_paused,omitempty"`
 	// Do not cache Telegram InputFileLocation here; its file_reference expires.
 }
 
@@ -79,20 +80,21 @@ func (s *Server) saveMetaCache() error {
 			rel = r
 		}
 		out.Items = append(out.Items, metaCacheItem{
-			ID:         it.ID,
-			PeerID:     it.PeerID,
-			MessageID:  it.MessageID,
-			LogicalPos: it.LogicalPos,
-			RelPath:    rel,
-			Name:       it.Name,
-			MIME:       it.MIME,
-			Type:       it.Type,
-			Size:       it.Size,
-			Duration:   it.Duration,
-			Date:       it.Date,
-			Status:     it.Status,
-			Error:      it.Error,
-			Progress:   it.Progress,
+			ID:           it.ID,
+			PeerID:       it.PeerID,
+			MessageID:    it.MessageID,
+			LogicalPos:   it.LogicalPos,
+			RelPath:      rel,
+			Name:         it.Name,
+			MIME:         it.MIME,
+			Type:         it.Type,
+			Size:         it.Size,
+			Duration:     it.Duration,
+			Date:         it.Date,
+			Status:       it.Status,
+			Error:        it.Error,
+			Progress:     it.Progress,
+			ManualPaused: it.ManualPaused,
 		})
 	}
 	s.mu.RUnlock()
@@ -159,21 +161,22 @@ func (s *Server) loadMetaCache(fingerprint string, expectedTotal int) ([]*Item, 
 			rel = c.Name
 		}
 		item := &Item{
-			ID:          c.ID,
-			PeerID:      c.PeerID,
-			MessageID:   c.MessageID,
-			LogicalPos:  c.LogicalPos,
-			Name:        c.Name,
-			MIME:        c.MIME,
-			Type:        c.Type,
-			Size:        c.Size,
-			Duration:    c.Duration,
-			Date:        c.Date,
-			Status:      statusQueued,
-			Error:       c.Error,
-			Progress:    c.Progress,
-			TargetPath:  filepath.Join(s.opts.Dir, rel),
-			DownloadURL: "/api/items/" + c.ID + "/download",
+			ID:           c.ID,
+			PeerID:       c.PeerID,
+			MessageID:    c.MessageID,
+			LogicalPos:   c.LogicalPos,
+			Name:         c.Name,
+			MIME:         c.MIME,
+			Type:         c.Type,
+			Size:         c.Size,
+			Duration:     c.Duration,
+			Date:         c.Date,
+			Status:       statusQueued,
+			Error:        c.Error,
+			Progress:     c.Progress,
+			ManualPaused: c.ManualPaused,
+			TargetPath:   filepath.Join(s.opts.Dir, rel),
+			DownloadURL:  "/api/items/" + c.ID + "/download",
 		}
 		// Restore permanent failure so --continue / auto image queue won't retry forever.
 		if c.Status == statusError {

@@ -193,6 +193,7 @@ func (s *Server) importFromJSONFiles(ctx context.Context, files []string, rangeT
 			zap.Int("expected", total),
 			zap.String("fingerprint", fingerprint))
 		s.resumePausedIfContinue(ctx)
+		s.enqueueVideoDownloads(ctx)
 		return nil
 	}
 
@@ -311,6 +312,7 @@ func (s *Server) importFromJSONFiles(ctx context.Context, files []string, rangeT
 		zap.Int("expected", total),
 		zap.String("fingerprint", fingerprint))
 	s.resumePausedIfContinue(ctx)
+	s.enqueueVideoDownloads(ctx)
 	return nil
 }
 
@@ -427,6 +429,7 @@ func (s *Server) importFromURLs(ctx context.Context, urls []string, rangeType st
 		zap.Int("items", added),
 		zap.String("fingerprint", fingerprint))
 	s.resumePausedIfContinue(ctx)
+	s.enqueueVideoDownloads(ctx)
 	return nil
 }
 
@@ -520,6 +523,9 @@ func (s *Server) resumePausedIfContinue(ctx context.Context) {
 		if it == nil || it.Status == statusCompleted || it.Status == statusError {
 			continue
 		}
+		if it.ManualPaused {
+			continue
+		}
 		if it.Status == statusPaused || tmpProgress(it.TargetPath, it.Size) > 0 {
 			ids = append(ids, id)
 		}
@@ -533,6 +539,22 @@ func (s *Server) resumePausedIfContinue(ctx context.Context) {
 	s.enqueueDownloads(ctx, ids)
 }
 
+func (s *Server) enqueueVideoDownloads(ctx context.Context) {
+	ids := make([]string, 0)
+	s.mu.RLock()
+	for _, id := range s.order {
+		it := s.items[id]
+		if it == nil || it.Type != mediaVideo || it.Status == statusCompleted || it.Status == statusError || it.ManualPaused {
+			continue
+		}
+		ids = append(ids, id)
+	}
+	s.mu.RUnlock()
+	if len(ids) > 0 {
+		s.enqueueDownloads(ctx, ids)
+	}
+}
+
 func (s *Server) resetImportState(fingerprint string, finished map[int]struct{}, total int) {
 	s.mu.Lock()
 	s.items = map[string]*Item{}
@@ -540,6 +562,8 @@ func (s *Server) resetImportState(fingerprint string, finished map[int]struct{},
 	s.fingerprint = fingerprint
 	s.finished = finished
 	s.downloading = map[string]struct{}{}
+	s.dlPriority = map[string]bool{}
+	s.preempted = map[string]struct{}{}
 	s.importTotal = total
 	s.importDone = 0
 	s.importError = ""

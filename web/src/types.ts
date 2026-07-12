@@ -30,6 +30,7 @@ export interface Item {
   resume_completed: boolean;
   skip_same: boolean;
   queue_pos?: number;
+  manual_paused?: boolean;
 }
 
 export interface ItemsPayload {

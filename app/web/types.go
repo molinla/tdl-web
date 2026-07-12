@@ -77,6 +77,7 @@ type Item struct {
 	ResumeCompleted bool   `json:"resume_completed"`
 	SkipSame        bool   `json:"skip_same"`
 	QueuePos        int    `json:"queue_pos,omitempty"` // 1-based wait queue; 0 if not waiting
+	ManualPaused    bool   `json:"manual_paused,omitempty"`
 
 	media *media
 	thumb *media
@@ -102,6 +103,8 @@ type Server struct {
 	fingerprint  string
 	finished     map[int]struct{}
 	downloading  map[string]struct{}
+	dlPriority   map[string]bool
+	preempted    map[string]struct{}
 	cancels      map[string]context.CancelFunc
 	importing    bool
 	importError  string
