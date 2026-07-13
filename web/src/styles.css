@@ -712,6 +712,12 @@ button {
   background: var(--bg-elevated);
 }
 
+.cover-shell > .cover-img--pending {
+  position: absolute;
+  inset: 0;
+  visibility: hidden;
+}
+
 .lazy-cover img {
   width: 100%;
   height: auto;
