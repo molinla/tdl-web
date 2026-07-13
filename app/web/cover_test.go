@@ -2,6 +2,7 @@ package web
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -284,6 +285,37 @@ func TestWaitCoverBuildReturnsWhenCacheReady(t *testing.T) {
 	defer cancel()
 	if err := s.waitCoverBuild(ctx, id); err != nil {
 		t.Fatalf("waitCoverBuild: %v", err)
+	}
+}
+
+func TestCoverFailureCooldownSkipsImmediateRetry(t *testing.T) {
+	s := newHandlerTestServer(t)
+	s.items["bad-cover"] = &Item{
+		ID:    "bad-cover",
+		Type:  mediaVideo,
+		media: &media{Name: "bad-cover.mp4"},
+	}
+
+	var builds atomic.Int32
+	orig := coverBuildHook
+	coverBuildHook = func(_ *Server, _ context.Context, _ string) error {
+		builds.Add(1)
+		return errors.New("poster failed")
+	}
+	defer func() { coverBuildHook = orig }()
+
+	s.enqueueCoverBuild("bad-cover", true)
+	waitCoverIdle(t, s)
+	if got := builds.Load(); got != 1 {
+		t.Fatalf("builds=%d want 1", got)
+	}
+
+	if pos := s.enqueueCoverBuild("bad-cover", true); pos != 0 {
+		t.Fatalf("retry position=%d want 0 during cooldown", pos)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if got := builds.Load(); got != 1 {
+		t.Fatalf("builds=%d want cooldown to suppress retry", got)
 	}
 }
 

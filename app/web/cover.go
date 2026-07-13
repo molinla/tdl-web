@@ -15,6 +15,7 @@ const (
 	coverWaitRetry       = 90 * time.Second
 	coverPollInterval    = 200 * time.Millisecond
 	coverRetryQueueDepth = 3
+	coverFailureCooldown = 5 * time.Minute
 )
 
 func coverLimit() int {
@@ -25,6 +26,7 @@ func (s *Server) ensureCoverScheduler() {
 	s.coverOnce.Do(func() {
 		s.coverPending = map[string]struct{}{}
 		s.coverActive = map[string]struct{}{}
+		s.coverFailed = map[string]time.Time{}
 		s.coverWake = make(chan struct{}, 1)
 		s.tgCover = make(chan struct{}, coverLimit())
 		go s.coverSchedulerLoop()
@@ -56,6 +58,12 @@ func (s *Server) enqueueCoverBuild(id string, priority bool) int {
 	s.coverMu.Lock()
 	defer s.coverMu.Unlock()
 
+	if retryAt, ok := s.coverFailed[id]; ok {
+		if time.Now().Before(retryAt) {
+			return 0
+		}
+		delete(s.coverFailed, id)
+	}
 	if _, ok := s.coverActive[id]; ok {
 		return 0
 	}
@@ -236,22 +244,33 @@ func (s *Server) coverSchedulerLoop() {
 		}
 
 		go func(jobID string) {
-			defer func() {
-				s.coverMu.Lock()
-				delete(s.coverActive, jobID)
-				delete(s.coverPending, jobID)
-				s.coverMu.Unlock()
-				s.wakeCoverScheduler()
-			}()
 			runCtx := s.ctx
 			if runCtx == nil {
 				runCtx = context.Background()
 			}
-			_ = s.ensureThumbCache("thumb:"+jobID, s.thumbCachePath(jobID), func() error {
+			err := s.ensureThumbCache("thumb:"+jobID, s.thumbCachePath(jobID), func() error {
 				return s.buildCoverFromTelegram(runCtx, jobID)
 			})
+			cooldown := err != nil && s.shouldCooldownCoverFailure(jobID)
+			s.coverMu.Lock()
+			if cooldown {
+				s.coverFailed[jobID] = time.Now().Add(coverFailureCooldown)
+			} else {
+				delete(s.coverFailed, jobID)
+			}
+			delete(s.coverActive, jobID)
+			delete(s.coverPending, jobID)
+			s.coverMu.Unlock()
+			s.wakeCoverScheduler()
 		}(id)
 	}
+}
+
+func (s *Server) shouldCooldownCoverFailure(id string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	item := s.items[id]
+	return item != nil && item.Type == mediaVideo && item.thumb == nil && item.media != nil
 }
 
 func (s *Server) popCoverJobLocked() (string, bool) {

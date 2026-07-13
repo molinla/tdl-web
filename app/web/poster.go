@@ -24,21 +24,11 @@ const (
 	posterPrefixChunk    = 512 * 1024
 	posterMinLocalBytes  = 64 * 1024
 	remotePosterTimeout  = 30 * time.Second
-	// Small videos without Telegram metadata thumbs can be downloaded to a
-	// temporary file and probed locally. This is still a last-resort cover path,
-	// not the normal media download queue.
-	remotePosterFullMaxBytes = 64 * 1024 * 1024
-	remotePosterFullTimeout  = 3 * time.Minute
+	remotePosterMaxBytes = 32 * 1024 * 1024
+	// Streaming-marked MP4s try a 4 MiB prefix first, then spend the remaining
+	// budget on a bounded head/tail fallback when the moov atom is at the end.
+	remotePosterFallbackSpan = (remotePosterMaxBytes - posterPrefixMaxBytes) / 2
 )
-
-var remotePosterSparsePasses = []struct {
-	span    int64
-	timeout time.Duration
-}{
-	{span: 16 * 1024 * 1024, timeout: 60 * time.Second},
-	{span: 32 * 1024 * 1024, timeout: 90 * time.Second},
-	{span: 64 * 1024 * 1024, timeout: 120 * time.Second},
-}
 
 // extractVideoPoster writes the first frame of a local video to outJpg using ffmpeg.
 func extractVideoPoster(videoPath, outJpg string) error {
@@ -94,8 +84,8 @@ func extractVideoPoster(videoPath, outJpg string) error {
 	return nil
 }
 
-// extractRemoteVideoPoster downloads only the start of a Telegram video and
-// extracts a JPEG poster. Used when there is no document thumb and no local file.
+// extractRemoteVideoPoster downloads bounded ranges from a Telegram video and
+// extracts a JPEG poster. It never downloads the whole remote file.
 func (s *Server) extractRemoteVideoPoster(ctx context.Context, m *media, outJpg string) error {
 	if validThumbCacheFile(outJpg) {
 		return nil
@@ -111,25 +101,20 @@ func (s *Server) extractRemoteVideoPoster(ctx context.Context, m *media, outJpg 
 	}
 
 	var attempts []string
-	for _, mode := range remotePosterPlan(m) {
-		switch mode {
-		case remotePosterModeFull:
-			if err := s.extractRemoteVideoPosterBytes(ctx, m, outJpg, m.Size, remotePosterFullTimeout); err == nil {
-				return nil
-			} else {
-				attempts = append(attempts, mode.String()+": "+err.Error())
-			}
+	for _, attempt := range remotePosterPlan(m) {
+		timeout := remotePosterAttemptTimeout(attempt)
+		switch attempt.mode {
 		case remotePosterModePrefix:
-			if err := s.extractRemoteVideoPosterBytes(ctx, m, outJpg, int64(posterPrefixMaxBytes), remotePosterTimeout); err == nil {
+			if err := s.extractRemoteVideoPosterBytes(ctx, m, outJpg, attempt.bytes, timeout); err == nil {
 				return nil
 			} else {
-				attempts = append(attempts, mode.String()+": "+err.Error())
+				attempts = append(attempts, attempt.String()+": "+err.Error())
 			}
 		case remotePosterModeSparse:
-			if err := s.extractRemoteSparseVideoPoster(ctx, m, outJpg); err == nil {
+			if err := s.extractRemoteSparseVideoPosterPass(ctx, m, outJpg, attempt.bytes, timeout); err == nil {
 				return nil
 			} else {
-				attempts = append(attempts, mode.String()+": "+err.Error())
+				attempts = append(attempts, attempt.String()+": "+err.Error())
 			}
 		}
 	}
@@ -142,46 +127,86 @@ func (s *Server) extractRemoteVideoPoster(ctx context.Context, m *media, outJpg 
 type remotePosterMode int
 
 const (
-	remotePosterModeFull remotePosterMode = iota
-	remotePosterModePrefix
+	remotePosterModePrefix remotePosterMode = iota
 	remotePosterModeSparse
 )
 
-func (m remotePosterMode) String() string {
-	switch m {
-	case remotePosterModeFull:
-		return "full"
+type remotePosterAttempt struct {
+	mode  remotePosterMode
+	bytes int64
+}
+
+func (a remotePosterAttempt) String() string {
+	switch a.mode {
 	case remotePosterModePrefix:
-		return "prefix"
+		return fmt.Sprintf("prefix-%dMiB", a.bytes/(1024*1024))
 	case remotePosterModeSparse:
-		return "sparse"
+		return fmt.Sprintf("sparse-%dMiB", a.bytes*2/(1024*1024))
 	default:
 		return "unknown"
 	}
 }
 
-func remotePosterPlan(m *media) []remotePosterMode {
-	if canExtractRemoteFullVideoPoster(m) {
-		return []remotePosterMode{remotePosterModeFull}
+func remotePosterPlan(m *media) []remotePosterAttempt {
+	if m == nil || m.Location == nil || m.Size <= 0 {
+		return nil
 	}
-	var plan []remotePosterMode
-	if canExtractRemotePrefixVideoPoster(m) {
-		plan = append(plan, remotePosterModePrefix)
+	ext := strings.ToLower(filepath.Ext(m.Name))
+	switch ext {
+	case ".mp4", ".m4v", ".3gp", ".3gpp":
+		return mp4PosterPlan(m)
+	case ".mov":
+		return []remotePosterAttempt{{mode: remotePosterModeSparse, bytes: 16 * 1024 * 1024}}
+	case ".mpg", ".mpeg", ".vob", ".ts", ".mts", ".m2ts":
+		return []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: 16 * 1024 * 1024}}
+	case ".avi":
+		return []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: remotePosterMaxBytes}}
+	case ".mkv", ".webm", ".flv", ".wmv", ".asf":
+		return []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: 16 * 1024 * 1024}}
 	}
-	if canExtractRemoteSparseVideoPoster(m) {
-		plan = append(plan, remotePosterModeSparse)
+
+	switch strings.ToLower(strings.TrimSpace(m.MIME)) {
+	case "video/mp4", "video/3gpp", "video/3gp":
+		return mp4PosterPlan(m)
+	case "video/quicktime":
+		return []remotePosterAttempt{{mode: remotePosterModeSparse, bytes: 16 * 1024 * 1024}}
+	case "video/mpeg", "video/mp2t":
+		return []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: 16 * 1024 * 1024}}
+	case "video/avi", "video/vnd.avi", "video/x-msvideo", "video/msvideo":
+		return []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: remotePosterMaxBytes}}
+	case "video/x-matroska", "video/webm", "video/x-flv", "video/x-ms-wmv", "video/x-ms-asf":
+		return []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: 16 * 1024 * 1024}}
 	}
-	return plan
+	return nil
+}
+
+func mp4PosterPlan(m *media) []remotePosterAttempt {
+	if m.SupportsStreaming || m.PreloadPrefixSize > 0 {
+		return []remotePosterAttempt{
+			{mode: remotePosterModePrefix, bytes: posterPrefixMaxBytes},
+			{mode: remotePosterModeSparse, bytes: remotePosterFallbackSpan},
+		}
+	}
+	return []remotePosterAttempt{{mode: remotePosterModeSparse, bytes: 16 * 1024 * 1024}}
+}
+
+func remotePosterAttemptTimeout(attempt remotePosterAttempt) time.Duration {
+	bytes := attempt.bytes
+	if attempt.mode == remotePosterModeSparse {
+		bytes *= 2
+	}
+	switch {
+	case bytes > 16*1024*1024:
+		return 90 * time.Second
+	case bytes > 8*1024*1024:
+		return 60 * time.Second
+	default:
+		return remotePosterTimeout
+	}
 }
 
 func (s *Server) extractRemoteVideoPosterBytes(ctx context.Context, m *media, outJpg string, maxBytes int64, timeout time.Duration) error {
-	need := int64(posterPrefixMaxBytes)
-	if maxBytes > 0 {
-		need = maxBytes
-	}
-	if m.Size > 0 && m.Size < need {
-		need = m.Size
-	}
+	need := boundedRemotePosterBytes(m.Size, maxBytes)
 	if need < posterMinLocalBytes {
 		return errors.New("media too small for poster prefix")
 	}
@@ -213,90 +238,44 @@ func remotePosterTempExt(m *media) string {
 			return ".mov"
 		case "video/3gpp", "video/3gp":
 			return ".3gp"
+		case "video/mpeg":
+			return ".mpg"
+		case "video/mp2t":
+			return ".ts"
+		case "video/avi", "video/vnd.avi", "video/x-msvideo", "video/msvideo":
+			return ".avi"
+		case "video/x-matroska":
+			return ".mkv"
+		case "video/webm":
+			return ".webm"
+		case "video/x-flv":
+			return ".flv"
+		case "video/x-ms-wmv", "video/x-ms-asf":
+			return ".wmv"
 		}
 	}
 	return ".mp4"
 }
 
 func canExtractRemoteVideoPoster(m *media) bool {
-	return canExtractRemoteFullVideoPoster(m) || canExtractRemotePrefixVideoPoster(m) || canExtractRemoteSparseVideoPoster(m)
+	return len(remotePosterPlan(m)) > 0
 }
 
-func canExtractRemoteFullVideoPoster(m *media) bool {
-	if m == nil || m.Location == nil {
-		return false
+func boundedRemotePosterBytes(size, requested int64) int64 {
+	if size <= 0 || requested <= 0 {
+		return 0
 	}
-	if m.Size <= 0 || m.Size > remotePosterFullMaxBytes {
-		return false
+	if requested > remotePosterMaxBytes {
+		requested = remotePosterMaxBytes
 	}
-	lowerName := strings.ToLower(m.Name)
-	lowerMIME := strings.ToLower(m.MIME)
-	return strings.HasPrefix(lowerMIME, "video/") ||
-		strings.HasSuffix(lowerName, ".mp4") ||
-		strings.HasSuffix(lowerName, ".mov") ||
-		strings.HasSuffix(lowerName, ".3gp") ||
-		strings.HasSuffix(lowerName, ".3gpp")
-}
-
-func canExtractRemotePrefixVideoPoster(m *media) bool {
-	if m == nil || m.Location == nil {
-		return false
+	if requested >= size {
+		requested = size / 2
 	}
-	lowerName := strings.ToLower(m.Name)
-	lowerMIME := strings.ToLower(m.MIME)
-	if lowerMIME == "video/quicktime" || strings.HasSuffix(lowerName, ".mov") {
-		return false
-	}
-	if lowerMIME != "video/mp4" && !strings.HasSuffix(lowerName, ".mp4") {
-		return false
-	}
-	return m.SupportsStreaming || m.PreloadPrefixSize > 0
-}
-
-func canExtractRemoteSparseVideoPoster(m *media) bool {
-	if m == nil || m.Location == nil || m.Size <= remotePosterFullMaxBytes {
-		return false
-	}
-	lowerName := strings.ToLower(m.Name)
-	lowerMIME := strings.ToLower(m.MIME)
-	return lowerMIME == "video/mp4" ||
-		lowerMIME == "video/quicktime" ||
-		lowerMIME == "video/3gpp" ||
-		lowerMIME == "video/3gp" ||
-		strings.HasSuffix(lowerName, ".mp4") ||
-		strings.HasSuffix(lowerName, ".mov") ||
-		strings.HasSuffix(lowerName, ".3gp") ||
-		strings.HasSuffix(lowerName, ".3gpp")
-}
-
-func (s *Server) extractRemoteSparseVideoPoster(ctx context.Context, m *media, outJpg string) error {
-	if m == nil || m.Size <= 0 {
-		return errors.New("invalid media size for sparse poster")
-	}
-	var attempts []string
-	for _, pass := range remotePosterSparsePasses {
-		if m.Size <= pass.span*2 {
-			if err := s.extractRemoteVideoPosterBytes(ctx, m, outJpg, m.Size, pass.timeout); err == nil {
-				return nil
-			} else {
-				attempts = append(attempts, fmt.Sprintf("full<=%d: %v", pass.span*2, err))
-				continue
-			}
-		}
-		if err := s.extractRemoteSparseVideoPosterPass(ctx, m, outJpg, pass.span, pass.timeout); err == nil {
-			return nil
-		} else {
-			attempts = append(attempts, fmt.Sprintf("head/tail %d: %v", pass.span, err))
-		}
-	}
-	return errors.New(strings.Join(attempts, "; "))
+	return requested
 }
 
 func (s *Server) extractRemoteSparseVideoPosterPass(ctx context.Context, m *media, outJpg string, span int64, timeout time.Duration) error {
-	headLen, tailOffset, tailLen, full := sparsePosterRanges(m.Size, span)
-	if full {
-		return s.extractRemoteVideoPosterBytes(ctx, m, outJpg, m.Size, timeout)
-	}
+	headLen, tailOffset, tailLen := sparsePosterRanges(m.Size, span)
 	if headLen < posterMinLocalBytes || tailLen < posterMinLocalBytes {
 		return errors.New("sparse ranges too small")
 	}
@@ -332,17 +311,17 @@ func (s *Server) extractRemoteSparseVideoPosterPass(ctx context.Context, m *medi
 	return extractVideoPoster(sparsePath, outJpg)
 }
 
-func sparsePosterRanges(size, span int64) (headLen, tailOffset, tailLen int64, full bool) {
+func sparsePosterRanges(size, span int64) (headLen, tailOffset, tailLen int64) {
 	if size <= 0 || span <= 0 {
-		return 0, 0, 0, false
+		return 0, 0, 0
 	}
-	if size <= span*2 {
-		return size, 0, 0, true
+	if span > remotePosterMaxBytes/2 {
+		span = remotePosterMaxBytes / 2
 	}
-	if span > size {
-		span = size
+	if span*2 >= size {
+		span = size / 4
 	}
-	return span, size - span, span, false
+	return span, size - span, span
 }
 
 func (s *Server) downloadMediaPrefix(ctx context.Context, m *media, dest string, maxBytes int64) error {

@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"sync"
+	"time"
 
 	"github.com/gotd/td/tg"
 	"golang.org/x/sync/singleflight"
@@ -147,6 +148,7 @@ type Server struct {
 	coverQueue    []string
 	coverPending  map[string]struct{}
 	coverActive   map[string]struct{}
+	coverFailed   map[string]time.Time
 	coverWake     chan struct{}
 	tgCover       chan struct{}
 

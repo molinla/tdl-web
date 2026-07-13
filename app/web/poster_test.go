@@ -11,95 +11,58 @@ import (
 	"github.com/gotd/td/tg"
 )
 
-func TestCanExtractRemoteVideoPosterAllowsSmallVideo(t *testing.T) {
-	m := &media{
-		Location: &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2, FileReference: []byte{1}},
-		Name:     "small.mp4",
-		MIME:     "video/mp4",
-		Size:     39 * 1024 * 1024,
-	}
-	if !canExtractRemoteVideoPoster(m) {
-		t.Fatal("small video should allow full temporary poster extraction")
-	}
-	if !canExtractRemoteFullVideoPoster(m) {
-		t.Fatal("small video should use full temporary extraction")
-	}
-}
-
-func TestCanExtractRemoteVideoPosterAllowsLargeNonStreamingVideoViaSparse(t *testing.T) {
-	m := &media{
-		Location: &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2, FileReference: []byte{1}},
-		Name:     "large.mp4",
-		MIME:     "video/mp4",
-		Size:     190 * 1024 * 1024,
-	}
-	if !canExtractRemoteVideoPoster(m) {
-		t.Fatal("large non-streaming mp4 should allow sparse poster extraction")
-	}
-	if !canExtractRemoteSparseVideoPoster(m) {
-		t.Fatal("large non-streaming mp4 should use sparse extraction")
-	}
-}
-
-func TestCanExtractRemoteVideoPosterAllowsStreamingPrefix(t *testing.T) {
-	m := &media{
-		Location:          &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2, FileReference: []byte{1}},
-		Name:              "large.mp4",
-		MIME:              "video/mp4",
-		Size:              190 * 1024 * 1024,
-		SupportsStreaming: true,
-	}
-	if !canExtractRemoteVideoPoster(m) {
-		t.Fatal("streaming mp4 should allow prefix poster extraction")
-	}
-	if canExtractRemoteFullVideoPoster(m) {
-		t.Fatal("large streaming mp4 should not use full temporary extraction")
-	}
-}
-
-func TestCanExtractRemoteVideoPosterAllowsLargeMOVViaSparse(t *testing.T) {
-	m := &media{
-		Location:          &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2, FileReference: []byte{1}},
-		Name:              "large.mov",
-		MIME:              "video/quicktime",
-		Size:              190 * 1024 * 1024,
-		SupportsStreaming: true,
-	}
-	if !canExtractRemoteVideoPoster(m) {
-		t.Fatal("large MOV should allow sparse poster extraction")
-	}
-	if canExtractRemotePrefixVideoPoster(m) {
-		t.Fatal("large MOV should not use prefix poster extraction")
-	}
-	if !canExtractRemoteSparseVideoPoster(m) {
-		t.Fatal("large MOV should use sparse poster extraction")
-	}
-}
-
 func TestRemotePosterPlanSelectsExpectedStrategyOrder(t *testing.T) {
 	loc := &tg.InputDocumentFileLocation{ID: 1, AccessHash: 2, FileReference: []byte{1}}
 	tests := []struct {
 		name string
 		m    *media
-		want []remotePosterMode
+		want []remotePosterAttempt
 	}{
 		{
-			name: "small video uses full temp download",
-			m:    &media{Location: loc, Name: "small.mp4", MIME: "video/mp4", Size: 39 * 1024 * 1024},
-			want: []remotePosterMode{remotePosterModeFull},
+			name: "streaming mp4 falls back within total budget",
+			m:    &media{Location: loc, Name: "video.mp4", MIME: "video/mp4", Size: 190 * 1024 * 1024, SupportsStreaming: true},
+			want: []remotePosterAttempt{
+				{mode: remotePosterModePrefix, bytes: posterPrefixMaxBytes},
+				{mode: remotePosterModeSparse, bytes: remotePosterFallbackSpan},
+			},
 		},
 		{
-			name: "large streaming mp4 tries prefix then sparse",
-			m:    &media{Location: loc, Name: "large.mp4", MIME: "video/mp4", Size: 190 * 1024 * 1024, SupportsStreaming: true},
-			want: []remotePosterMode{remotePosterModePrefix, remotePosterModeSparse},
+			name: "non-streaming mp4 uses bounded head and tail",
+			m:    &media{Location: loc, Name: "video.mp4", MIME: "video/mp4", Size: 190 * 1024 * 1024},
+			want: []remotePosterAttempt{{mode: remotePosterModeSparse, bytes: 16 * 1024 * 1024}},
 		},
 		{
-			name: "large mov uses sparse",
-			m:    &media{Location: loc, Name: "large.mov", MIME: "video/quicktime", Size: 190 * 1024 * 1024},
-			want: []remotePosterMode{remotePosterModeSparse},
+			name: "mov extension wins over mp4 mime",
+			m:    &media{Location: loc, Name: "video.mov", MIME: "video/mp4", Size: 190 * 1024 * 1024},
+			want: []remotePosterAttempt{{mode: remotePosterModeSparse, bytes: 16 * 1024 * 1024}},
 		},
 		{
-			name: "large unknown file unsupported",
+			name: "mpeg uses prefix",
+			m:    &media{Location: loc, Name: "video.mpg", MIME: "video/mpeg", Size: 190 * 1024 * 1024},
+			want: []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: 16 * 1024 * 1024}},
+		},
+		{
+			name: "avi uses largest bounded prefix",
+			m:    &media{Location: loc, Name: "video.avi", MIME: "video/vnd.avi", Size: 190 * 1024 * 1024},
+			want: []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: remotePosterMaxBytes}},
+		},
+		{
+			name: "matroska uses prefix",
+			m:    &media{Location: loc, Name: "video.mkv", MIME: "video/x-matroska", Size: 190 * 1024 * 1024},
+			want: []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: 16 * 1024 * 1024}},
+		},
+		{
+			name: "mime fallback works without extension",
+			m:    &media{Location: loc, Name: "video", MIME: "video/mpeg", Size: 190 * 1024 * 1024},
+			want: []remotePosterAttempt{{mode: remotePosterModePrefix, bytes: 16 * 1024 * 1024}},
+		},
+		{
+			name: "unknown video stays unsupported",
+			m:    &media{Location: loc, Name: "video.bin", MIME: "video/unknown", Size: 190 * 1024 * 1024},
+			want: nil,
+		},
+		{
+			name: "unknown file stays unsupported",
 			m:    &media{Location: loc, Name: "large.bin", MIME: "application/octet-stream", Size: 190 * 1024 * 1024},
 			want: nil,
 		},
@@ -113,14 +76,26 @@ func TestRemotePosterPlanSelectsExpectedStrategyOrder(t *testing.T) {
 	}
 }
 
-func TestSparsePosterRanges(t *testing.T) {
-	head, tailOffset, tail, full := sparsePosterRanges(200*1024*1024, 16*1024*1024)
-	if full || head != 16*1024*1024 || tail != 16*1024*1024 || tailOffset != 184*1024*1024 {
-		t.Fatalf("large ranges head=%d tailOffset=%d tail=%d full=%v", head, tailOffset, tail, full)
+func TestRemotePosterReadsStayBounded(t *testing.T) {
+	if total := posterPrefixMaxBytes + remotePosterFallbackSpan*2; total != remotePosterMaxBytes {
+		t.Fatalf("streaming fallback total=%d want %d", total, remotePosterMaxBytes)
 	}
-	head, tailOffset, tail, full = sparsePosterRanges(20*1024*1024, 16*1024*1024)
-	if !full || head != 20*1024*1024 || tailOffset != 0 || tail != 0 {
-		t.Fatalf("small ranges head=%d tailOffset=%d tail=%d full=%v", head, tailOffset, tail, full)
+	if got := boundedRemotePosterBytes(10*1024*1024, remotePosterMaxBytes); got != 5*1024*1024 {
+		t.Fatalf("small prefix=%d want half file", got)
+	}
+	if got := boundedRemotePosterBytes(100*1024*1024, 64*1024*1024); got != remotePosterMaxBytes {
+		t.Fatalf("large prefix=%d want max %d", got, remotePosterMaxBytes)
+	}
+}
+
+func TestSparsePosterRanges(t *testing.T) {
+	head, tailOffset, tail := sparsePosterRanges(200*1024*1024, 16*1024*1024)
+	if head != 16*1024*1024 || tail != 16*1024*1024 || tailOffset != 184*1024*1024 {
+		t.Fatalf("large ranges head=%d tailOffset=%d tail=%d", head, tailOffset, tail)
+	}
+	head, tailOffset, tail = sparsePosterRanges(20*1024*1024, 16*1024*1024)
+	if head != 5*1024*1024 || tail != 5*1024*1024 || tailOffset != 15*1024*1024 {
+		t.Fatalf("small ranges head=%d tailOffset=%d tail=%d", head, tailOffset, tail)
 	}
 	if got := alignDown(12345, 1024); got != 12288 {
 		t.Fatalf("alignDown=%d want 12288", got)
