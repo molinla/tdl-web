@@ -7,6 +7,7 @@ import {
   type PointerEvent as ReactPointerEvent,
 } from "react";
 import { coverURL } from "./api";
+import { ensureCoverResource, type CoverResource } from "./coverResource";
 import type { Item } from "./types";
 
 const COLUMN_COUNT = 14;
@@ -20,7 +21,7 @@ const FILM_ROTATION = -Math.PI / 4;
 const FILM_BASE_OPACITY = 0.17;
 const FILM_OBSCURED_OPACITY = 0.2;
 const FILM_BLUR_PX = 26;
-const MAX_DPR = 2;
+const MAX_DPR = 1.5;
 
 type FilmFrameData = {
   item: Item;
@@ -51,12 +52,6 @@ type FilmMetrics = {
   frameHeight: number;
   pitch: number;
   cycle: number;
-};
-
-type ImageCacheEntry = {
-  image: HTMLImageElement;
-  status: "loading" | "ready" | "error";
-  promise: Promise<void>;
 };
 
 export type FilmClickDetail = {
@@ -247,7 +242,6 @@ export function FilmBackground({
   const initialPhaseRef = useRef<FilmInitialPhase>("waiting");
   const initialStartRef = useRef(0);
   const initialTokenRef = useRef(0);
-  const imageCacheRef = useRef(new Map<string, ImageCacheEntry>());
   const offsetsRef = useRef<number[]>(Array(COLUMN_COUNT).fill(0));
   const speedMultiplierRef = useRef(1);
   const sideHoverRef = useRef(false);
@@ -262,30 +256,8 @@ export function FilmBackground({
   const reducedMotionRef = useRef(false);
   const nextLayer = useMemo(() => buildFilmLayer(items), [items]);
 
-  function ensureImage(url: string): ImageCacheEntry {
-    const cached = imageCacheRef.current.get(url);
-    if (cached) return cached;
-
-    const image = new Image();
-    image.decoding = "async";
-    const entry: ImageCacheEntry = {
-      image,
-      status: "loading",
-      promise: Promise.resolve(),
-    };
-    entry.promise = new Promise<void>((resolve) => {
-      image.onload = () => {
-        entry.status = "ready";
-        resolve();
-      };
-      image.onerror = () => {
-        entry.status = "error";
-        resolve();
-      };
-    });
-    image.src = url;
-    imageCacheRef.current.set(url, entry);
-    return entry;
+  function ensureImage(url: string): CoverResource {
+    return ensureCoverResource(url);
   }
 
   function preloadLayer(layer: FilmLayerData): Promise<void> {
@@ -608,7 +580,7 @@ export function FilmBackground({
     ctx.fillStyle = "rgba(24, 24, 24, 0.9)";
     ctx.fillRect(imageX, imageY, imageW, imageH);
 
-    const cached = imageCacheRef.current.get(frame.url);
+    const cached = ensureImage(frame.url);
     if (cached?.status === "ready") {
       const fit = objectFitCoverRect(cached.image, imageX, imageY, imageW, imageH);
       if (fit && imageOpacity > 0.001) {
@@ -777,8 +749,28 @@ export function FilmBackground({
     };
   }, []);
 
+  const tabVisibleRef = useRef(
+    typeof document !== "undefined"
+      ? document.visibilityState === "visible"
+      : true,
+  );
+
+  useEffect(() => {
+    const onVisibilityChange = () => {
+      tabVisibleRef.current = document.visibilityState === "visible";
+      if (tabVisibleRef.current) lastFrameRef.current = null;
+    };
+    document.addEventListener("visibilitychange", onVisibilityChange);
+    return () =>
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+  }, []);
+
   useEffect(() => {
     const tick = (now: number) => {
+      if (!tabVisibleRef.current) {
+        rafRef.current = window.requestAnimationFrame(tick);
+        return;
+      }
       const canvas = canvasRef.current;
       if (!canvas) {
         rafRef.current = window.requestAnimationFrame(tick);

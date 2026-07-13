@@ -18,7 +18,7 @@ export function scrollToItem(id: string) {
     return;
   }
   document.getElementById(`scroll-item-${id}`)?.scrollIntoView({
-    behavior: "smooth",
+    behavior: "auto",
     block: "center",
   });
 }

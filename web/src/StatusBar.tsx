@@ -11,8 +11,11 @@ export interface StatusBarProps {
   importItems: number;
   downloadingCount: number;
   queuedCount: number;
+  coverBuildingCount: number;
+  coverQueuedCount: number;
   coverLoadingCount: number;
   itemCount: number;
+  completedCount: number;
 }
 
 function formatProgress(done: number, total: number): string {
@@ -32,8 +35,11 @@ export function StatusBar({
   importItems,
   downloadingCount,
   queuedCount,
+  coverBuildingCount,
+  coverQueuedCount,
   coverLoadingCount,
   itemCount,
+  completedCount,
 }: StatusBarProps) {
   let message = "";
   let source = "";
@@ -54,12 +60,14 @@ export function StatusBar({
       progress = `${importItems} 项`;
     }
   } else {
-    message = "就绪";
     const parts: string[] = [];
     if (itemCount > 0) parts.push(`${itemCount} 项`);
+    if (completedCount > 0) parts.push(`${completedCount} 已完成`);
     if (downloadingCount > 0) parts.push(`${downloadingCount} 项下载中`);
     if (queuedCount > 0) parts.push(`${queuedCount} 项排队`);
-    if (coverLoadingCount > 0) parts.push(`${coverLoadingCount} 个封面加载中`);
+    if (coverBuildingCount > 0) parts.push(`${coverBuildingCount} 个封面构建中`);
+    if (coverQueuedCount > 0) parts.push(`${coverQueuedCount} 个封面队列`);
+    if (coverLoadingCount > 0) parts.push(`${coverLoadingCount} 个封面请求中`);
     progress = parts.join(" · ");
   }
 
@@ -68,19 +76,20 @@ export function StatusBar({
 
   return (
     <div
-      className={["status-bar", mode !== "ready" ? "status-bar--active" : ""]
+      className={[
+        "stats",
+        mode !== "ready" ? "stats--active" : "",
+      ]
         .filter(Boolean)
         .join(" ")}
       aria-live="polite"
     >
-      <div className="status-bar-main">
-        {mode === "connecting" && <span className="status-bar-spinner" />}
-        <span className="status-bar-message">{message}</span>
-        {showPill && (
-          <span className={["status-pill", pillClass].join(" ")}>{source}</span>
-        )}
-      </div>
-      {progress && <div className="status-bar-progress">{progress}</div>}
+      {mode === "connecting" && <span className="status-bar-spinner" />}
+      {message && <span className="stats-message">{message}</span>}
+      {showPill && (
+        <span className={["status-pill", pillClass].join(" ")}>{source}</span>
+      )}
+      {progress && <span className="stats-progress">{progress}</span>}
     </div>
   );
 }

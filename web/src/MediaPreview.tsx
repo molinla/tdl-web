@@ -1,12 +1,15 @@
 import {
   useEffect,
   useLayoutEffect,
+  useMemo,
   useRef,
   useState,
   type CSSProperties,
 } from "react";
+import { Pause, Play, SkipBack, SkipForward, X } from "lucide-react";
 import {
   displayName,
+  formatMessageDate,
   mediaURL,
   probeMediaError,
   progressPct,
@@ -15,6 +18,7 @@ import type { Item } from "./types";
 
 const TRANSITION_MS = 450;
 const FILM_FADE_TRANSITION_MS = 320;
+const CHROME_VISIBLE_MS = 3000;
 
 type PlayerState = { kind: "video"; item: Item } | { kind: "image"; item: Item };
 type PreviewTransitionMode = "zoom" | "film-fade";
@@ -31,7 +35,7 @@ function defaultAspect(kind: PlayerState["kind"]) {
 
 /** Immersive stage: one black canvas sized to aspect, no outer panel chrome. */
 function computeImmersiveLayout(aspectHeightPerWidth: number): Layout {
-  const pad = 16;
+  const pad = 0;
   const maxW = window.innerWidth - pad * 2;
   const maxH = window.innerHeight - pad * 2;
 
@@ -84,17 +88,24 @@ function boxStyle(box: Box, rotation = 0): CSSProperties {
   };
 }
 
+function formatClock(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds <= 0) return "0:00";
+  const total = Math.floor(seconds);
+  const s = String(total % 60).padStart(2, "0");
+  const m = Math.floor(total / 60) % 60;
+  const h = Math.floor(total / 3600);
+  return h > 0 ? `${h}:${String(m).padStart(2, "0")}:${s}` : `${m}:${s}`;
+}
+
+function releaseVideo(video: HTMLVideoElement | null | undefined) {
+  if (!video) return;
+  video.pause();
+  video.removeAttribute("src");
+  video.load();
+}
+
 function PreviewPauseIcon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M9 6v12M15 6v12"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
+  return <Pause size={20} strokeWidth={2} aria-hidden="true" />;
 }
 
 function RingProgressButton({
@@ -175,19 +186,6 @@ function RingProgressButton({
   );
 }
 
-function PreviewCloseIcon() {
-  return (
-    <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-      <path
-        d="M6 6l12 12M18 6L6 18"
-        stroke="currentColor"
-        strokeWidth="2"
-        strokeLinecap="round"
-      />
-    </svg>
-  );
-}
-
 export function MediaPreview({
   player,
   originRect,
@@ -196,8 +194,10 @@ export function MediaPreview({
   thumbSrc,
   aspectRatio,
   closing,
+  mediaItems,
   playError,
   onPlayError,
+  onNavigate,
   onCloseRequest,
   onClosed,
   onPause,
@@ -209,14 +209,18 @@ export function MediaPreview({
   thumbSrc: string;
   aspectRatio?: number;
   closing: boolean;
+  mediaItems: Item[];
   playError: string;
   onPlayError: (msg: string) => void;
+  onNavigate: (item: Item) => void;
   onCloseRequest: () => void;
   onClosed: () => void;
   onPause: (item: Item) => void;
 }) {
   const originBox = useRef<Box>(rectToBox(originRect));
   const originRotationRef = useRef(originRotation);
+  const initializedRef = useRef(false);
+  const phaseRef = useRef<"entering" | "open" | "leaving">("entering");
   const [phase, setPhase] = useState<"entering" | "open" | "leaving">(
     "entering",
   );
@@ -224,6 +228,9 @@ export function MediaPreview({
   const [chromeVisible, setChromeVisible] = useState(false);
   const [showVideo, setShowVideo] = useState(false);
   const [videoReady, setVideoReady] = useState(false);
+  const [playing, setPlaying] = useState(false);
+  const [currentTime, setCurrentTime] = useState(0);
+  const [duration, setDuration] = useState(0);
   const reducedMotion = useRef(
     typeof window !== "undefined" &&
       window.matchMedia("(prefers-reduced-motion: reduce)").matches,
@@ -232,48 +239,139 @@ export function MediaPreview({
   onClosedRef.current = onClosed;
   const closeHandledRef = useRef(false);
   const videoRef = useRef<HTMLVideoElement>(null);
+  const hideChromeTimerRef = useRef<number | null>(null);
 
   const aspect = aspectRatio ?? defaultAspect(player.kind);
   const isFilmFade = transitionMode === "film-fade";
   const transitionMs = isFilmFade ? FILM_FADE_TRANSITION_MS : TRANSITION_MS;
 
+  const item = player.item;
+  const isOpen = phase === "open";
+  const rootOpen = isOpen || phase === "leaving" || isFilmFade;
+  const showVideoPlayer =
+    player.kind === "video" && (showVideo || phase === "leaving" || isFilmFade);
+  const mediaIndex = useMemo(
+    () => mediaItems.findIndex((media) => media.id === item.id),
+    [item.id, mediaItems],
+  );
+  const canNavigate = mediaItems.length > 1;
+
+  function clearChromeTimer() {
+    if (hideChromeTimerRef.current != null) {
+      window.clearTimeout(hideChromeTimerRef.current);
+      hideChromeTimerRef.current = null;
+    }
+  }
+
+  function showChrome() {
+    if (phaseRef.current !== "open") return;
+    setChromeVisible(true);
+    clearChromeTimer();
+    hideChromeTimerRef.current = window.setTimeout(() => {
+      hideChromeTimerRef.current = null;
+      setChromeVisible(false);
+    }, CHROME_VISIBLE_MS);
+  }
+
+  function resetPlaybackRate() {
+    if (videoRef.current) videoRef.current.playbackRate = 1;
+  }
+
+  function syncVideoTime(video = videoRef.current) {
+    if (!video) return;
+    setCurrentTime(video.currentTime || 0);
+    setDuration(Number.isFinite(video.duration) ? video.duration : 0);
+  }
+
+  function playVideo(video = videoRef.current) {
+    if (!video || player.kind !== "video" || phaseRef.current !== "open") return;
+    void video.play().catch(() => setPlaying(false));
+  }
+
+  function togglePlay() {
+    const video = videoRef.current;
+    if (!video) return;
+    showChrome();
+    if (video.paused) {
+      playVideo(video);
+    } else {
+      video.pause();
+    }
+  }
+
+  function seek(value: string) {
+    const video = videoRef.current;
+    const next = Number(value);
+    if (!Number.isFinite(next)) return;
+    setCurrentTime(next);
+    if (video) video.currentTime = next;
+    showChrome();
+  }
+
+  function navigate(delta: number) {
+    if (!canNavigate) return;
+    const start = mediaIndex >= 0 ? mediaIndex : 0;
+    const next = mediaItems[(start + delta + mediaItems.length) % mediaItems.length];
+    if (next) {
+      resetPlaybackRate();
+      onNavigate(next);
+      showChrome();
+    }
+  }
+
+  useEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
+
   useLayoutEffect(() => {
+    const nextLayout = computeLayout(player.kind, aspect);
+    setVideoReady(false);
+    setPlaying(false);
+    setCurrentTime(0);
+    setDuration(0);
+    resetPlaybackRate();
+
+    if (initializedRef.current && phaseRef.current === "open") {
+      setMediaBox(nextLayout.media);
+      setShowVideo(player.kind === "video");
+      return () => releaseVideo(videoRef.current);
+    }
+
+    initializedRef.current = true;
     originBox.current = rectToBox(originRect);
     originRotationRef.current = originRotation;
-    const nextLayout = computeLayout(player.kind, aspect);
 
     if (isFilmFade) {
       setMediaBox(nextLayout.media);
       setPhase("entering");
       setChromeVisible(false);
       setShowVideo(player.kind === "video");
-      setVideoReady(false);
 
       if (reducedMotion.current) {
         setPhase("open");
-        setChromeVisible(true);
-        return;
+        return () => releaseVideo(videoRef.current);
       }
 
       const id = window.requestAnimationFrame(() => {
         setPhase("open");
       });
-      return () => window.cancelAnimationFrame(id);
+      return () => {
+        window.cancelAnimationFrame(id);
+        releaseVideo(videoRef.current);
+      };
     }
 
     setMediaBox(reducedMotion.current ? nextLayout.media : originBox.current);
 
     if (reducedMotion.current) {
       setPhase("open");
-      setChromeVisible(true);
       if (player.kind === "video") setShowVideo(true);
-      return;
+      return () => releaseVideo(videoRef.current);
     }
 
     setPhase("entering");
     setChromeVisible(false);
     setShowVideo(false);
-    setVideoReady(false);
 
     const id = window.requestAnimationFrame(() => {
       window.requestAnimationFrame(() => {
@@ -281,15 +379,11 @@ export function MediaPreview({
         setPhase("open");
       });
     });
-    return () => window.cancelAnimationFrame(id);
-  }, [
-    player.item.id,
-    player.kind,
-    originRect,
-    originRotation,
-    aspect,
-    isFilmFade,
-  ]);
+    return () => {
+      window.cancelAnimationFrame(id);
+      releaseVideo(videoRef.current);
+    };
+  }, [player.item.id, player.kind, originRect, originRotation, aspect, isFilmFade]);
 
   useEffect(() => {
     const root = document.documentElement;
@@ -300,17 +394,64 @@ export function MediaPreview({
   }, []);
 
   useEffect(() => {
-    const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCloseRequest();
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === "Escape") {
+        onCloseRequest();
+        return;
+      }
+      if (e.key !== "ArrowRight" || player.kind !== "video") return;
+      if (videoRef.current) videoRef.current.playbackRate = 2;
+      showChrome();
     };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [onCloseRequest]);
+    const onKeyUp = (e: KeyboardEvent) => {
+      if (e.key === "ArrowRight") resetPlaybackRate();
+    };
+    window.addEventListener("keydown", onKeyDown);
+    window.addEventListener("keyup", onKeyUp);
+    window.addEventListener("blur", resetPlaybackRate);
+    return () => {
+      window.removeEventListener("keydown", onKeyDown);
+      window.removeEventListener("keyup", onKeyUp);
+      window.removeEventListener("blur", resetPlaybackRate);
+      resetPlaybackRate();
+    };
+  }, [onCloseRequest, player.kind, player.item.id]);
+
+  useEffect(() => {
+    if (showVideoPlayer) return;
+    releaseVideo(videoRef.current);
+  }, [showVideoPlayer]);
+
+  useEffect(() => {
+    return () => {
+      clearChromeTimer();
+      resetPlaybackRate();
+      releaseVideo(videoRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    if (phase !== "open") {
+      clearChromeTimer();
+      setChromeVisible(false);
+      return;
+    }
+    if (player.kind === "video") setShowVideo(true);
+    showChrome();
+  }, [phase, player.kind, player.item.id]);
+
+  useEffect(() => {
+    if (phase === "open" && player.kind === "video" && videoReady) {
+      playVideo();
+    }
+  }, [phase, player.kind, player.item.id, videoReady]);
 
   useEffect(() => {
     if (!closing) return;
 
     closeHandledRef.current = false;
+    clearChromeTimer();
+    resetPlaybackRate();
     videoRef.current?.pause();
     setChromeVisible(false);
     setPhase("leaving");
@@ -330,9 +471,7 @@ export function MediaPreview({
       return () => window.clearTimeout(t);
     }
 
-    {
-      setMediaBox(resolveOriginRect(player.item.id, originBox.current));
-    }
+    setMediaBox(resolveOriginRect(player.item.id, originBox.current));
 
     if (reducedMotion.current) {
       onClosedRef.current();
@@ -348,25 +487,13 @@ export function MediaPreview({
   }, [aspect, closing, isFilmFade, player.item.id, player.kind, transitionMs]);
 
   useEffect(() => {
-    if (phase !== "open") return;
-    if (player.kind === "video") {
-      setShowVideo(true);
-    }
-    const t = window.setTimeout(
-      () => setChromeVisible(true),
-      reducedMotion.current || isFilmFade ? 0 : transitionMs * 0.55,
-    );
-    return () => window.clearTimeout(t);
-  }, [isFilmFade, phase, player.kind, transitionMs]);
-
-  useEffect(() => {
     const onResize = () => {
-      if (phase !== "open") return;
+      if (phaseRef.current !== "open") return;
       setMediaBox(computeLayout(player.kind, aspect).media);
     };
     window.addEventListener("resize", onResize);
     return () => window.removeEventListener("resize", onResize);
-  }, [phase, player.kind, aspect]);
+  }, [player.kind, aspect]);
 
   function handleMediaTransitionEnd(e: React.TransitionEvent) {
     if (phase !== "leaving" || closeHandledRef.current) return;
@@ -376,11 +503,11 @@ export function MediaPreview({
     onClosedRef.current();
   }
 
-  const item = player.item;
-  const isOpen = phase === "open";
-  const rootOpen = isOpen || phase === "leaving" || isFilmFade;
-  const showVideoPlayer =
-    player.kind === "video" && (showVideo || phase === "leaving" || isFilmFade);
+  const progressMax = duration || 1;
+  const progressValue = Math.min(currentTime, progressMax);
+  const progressPercent =
+    duration > 0 ? Math.min(100, Math.max(0, (currentTime / duration) * 100)) : 0;
+  const date = formatMessageDate(item.date);
 
   return (
     <div
@@ -393,6 +520,7 @@ export function MediaPreview({
       ]
         .filter(Boolean)
         .join(" ")}
+      onMouseMove={showChrome}
     >
       <button
         type="button"
@@ -406,6 +534,15 @@ export function MediaPreview({
         aria-label="关闭预览"
         onClick={onCloseRequest}
       />
+
+      <button
+        type="button"
+        className="preview-icon-btn preview-close-btn"
+        onClick={onCloseRequest}
+        aria-label="关闭"
+      >
+        <X size={44} strokeWidth={1.7} aria-hidden="true" />
+      </button>
 
       <div
         className={[
@@ -441,12 +578,24 @@ export function MediaPreview({
                 key={item.id}
                 className="preview-media-layer preview-media-layer--video"
                 src={mediaURL(item.stream_url)}
-                controls={phase !== "leaving"}
                 autoPlay
                 playsInline
-                preload="auto"
-                onLoadedData={() => setVideoReady(true)}
-                onCanPlay={() => setVideoReady(true)}
+                preload="metadata"
+                onLoadedMetadata={(e) => syncVideoTime(e.currentTarget)}
+                onLoadedData={(e) => {
+                  syncVideoTime(e.currentTarget);
+                  setVideoReady(true);
+                  playVideo(e.currentTarget);
+                }}
+                onCanPlay={(e) => {
+                  syncVideoTime(e.currentTarget);
+                  setVideoReady(true);
+                  playVideo(e.currentTarget);
+                }}
+                onTimeUpdate={(e) => syncVideoTime(e.currentTarget)}
+                onPlay={() => setPlaying(true)}
+                onPause={() => setPlaying(false)}
+                onEnded={() => setPlaying(false)}
                 onError={() => {
                   const known = item.error?.trim();
                   if (known) {
@@ -479,13 +628,89 @@ export function MediaPreview({
 
       <div
         className={[
-          "preview-video-actions",
-          chromeVisible ? "" : "preview-video-actions--collapsed",
+          "preview-controller",
+          player.kind === "image" ? "preview-controller--image" : "",
+          chromeVisible ? "" : "preview-controller--collapsed",
         ]
           .filter(Boolean)
           .join(" ")}
       >
-        {(item.status === "caching" || item.status === "paused") && (
+        <div className="preview-title-card">
+          <h3>{displayName(item)}</h3>
+          {date && <div className="preview-title-date">{date}</div>}
+        </div>
+        {player.kind === "video" && (
+          <div className="preview-progress-row">
+            <span>{formatClock(currentTime)}</span>
+            <div
+              className="preview-progress-hit"
+              onPointerDown={(e) => {
+                if (e.button !== 0) return;
+                const rect = e.currentTarget.getBoundingClientRect();
+                const ratio = Math.min(
+                  1,
+                  Math.max(0, (e.clientX - rect.left) / rect.width),
+                );
+                seek(String(ratio * progressMax));
+              }}
+            >
+              <input
+                className="preview-progress"
+                type="range"
+                min={0}
+                max={progressMax}
+                step="0.1"
+                value={progressValue}
+                style={
+                  {
+                    "--preview-progress-pct": `${progressPercent}%`,
+                  } as CSSProperties
+                }
+                onChange={(e) => seek(e.currentTarget.value)}
+                aria-label="播放进度"
+              />
+            </div>
+            <span>{formatClock(duration)}</span>
+          </div>
+        )}
+        <div className="preview-controller-buttons">
+          <button
+            type="button"
+            className="preview-controller-btn"
+            disabled={!canNavigate}
+            onClick={() => navigate(-1)}
+            aria-label="上一个"
+          >
+            <SkipBack size={24} fill="currentColor" aria-hidden="true" />
+          </button>
+          {player.kind === "video" && (
+            <button
+              type="button"
+              className="preview-controller-btn preview-controller-btn--play"
+              onClick={togglePlay}
+              aria-label={playing ? "暂停" : "播放"}
+            >
+              {playing ? (
+                <Pause size={28} fill="currentColor" aria-hidden="true" />
+              ) : (
+                <Play size={28} fill="currentColor" aria-hidden="true" />
+              )}
+            </button>
+          )}
+          <button
+            type="button"
+            className="preview-controller-btn"
+            disabled={!canNavigate}
+            onClick={() => navigate(1)}
+            aria-label="下一个"
+          >
+            <SkipForward size={24} fill="currentColor" aria-hidden="true" />
+          </button>
+        </div>
+      </div>
+
+      {(item.status === "caching" || item.status === "paused") && (
+        <div className="preview-download-actions">
           <RingProgressButton
             pct={progressPct(item)}
             label={
@@ -498,16 +723,8 @@ export function MediaPreview({
               item.status === "caching" ? () => onPause(item) : undefined
             }
           />
-        )}
-        <button
-          type="button"
-          className="preview-icon-btn"
-          onClick={onCloseRequest}
-          aria-label="关闭"
-        >
-          <PreviewCloseIcon />
-        </button>
-      </div>
+        </div>
+      )}
       {chromeVisible && playError && (
         <div className="preview-global-error banner error">{playError}</div>
       )}

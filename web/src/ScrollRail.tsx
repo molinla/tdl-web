@@ -117,7 +117,7 @@ export function ScrollRail({
           active: sectionActive,
           onClick: () => {
             document.getElementById(section.id)?.scrollIntoView({
-              behavior: "smooth",
+              behavior: "auto",
               block: "start",
             });
           },

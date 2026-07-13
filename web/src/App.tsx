@@ -47,8 +47,11 @@ const masonryBoxCache = new Map<
 >();
 const coverAspectCache = new Map<string, number>();
 const VIRTUAL_BUFFER_SCREENS = 2;
+const VIDEO_QUEUE_DISPLAY_LIMIT = 50;
 const FILM_BACKGROUND_SETTLE_MS = 180;
 const FILM_BACKGROUND_STAGE_SIZE = 200;
+const CARD_OVERLAY_SLIDE_MS = 220;
+const DEFAULT_COVER_ASPECT = 4 / 3;
 
 type VirtualWindowEntry = {
   item: Item;
@@ -251,6 +254,10 @@ function estimateMasonryItemSize(
     return Math.max(1, Math.ceil(columnWidth * ratio));
   }
 
+  if (item.cover_aspect && item.cover_aspect > 0 && columnWidth > 0) {
+    return Math.max(1, Math.ceil(columnWidth * item.cover_aspect));
+  }
+
   const measured = masonryBoxCache.get(item.id);
   if (measured && measured.height > 0) {
     if (columnWidth > 0 && measured.width > 0) {
@@ -262,6 +269,9 @@ function estimateMasonryItemSize(
     return measured.height;
   }
 
+  if (columnWidth > 0) {
+    return Math.max(1, Math.ceil(columnWidth * DEFAULT_COVER_ASPECT));
+  }
   return masonrySizeCache.get(item.id) ?? fallback;
 }
 
@@ -339,7 +349,14 @@ function MasonryColumn({
   });
 
   useLayoutEffect(() => {
-    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = () => false;
+    virtualizer.shouldAdjustScrollPositionOnItemSizeChange = (
+      item,
+      _delta,
+      instance,
+    ) => item.start < (instance.scrollOffset ?? 0);
+    return () => {
+      virtualizer.shouldAdjustScrollPositionOnItemSizeChange = undefined;
+    };
   }, [virtualizer]);
 
   const virtualItems = virtualizer.getVirtualItems();
@@ -360,7 +377,7 @@ function MasonryColumn({
       registerScrollTarget(item.id, () => {
         virtualizer.scrollToIndex(index, {
           align: "center",
-          behavior: "smooth",
+          behavior: "auto",
         });
       }),
     );
@@ -511,86 +528,29 @@ function VirtualMasonry({
 
 const COVER_RETRY_MS = 2000;
 const COVER_PRIORITY_RETRY_MS = 700;
-const COVER_TOTAL_MAX = 6;
-const COVER_LOW_PRIORITY_MAX = 2;
-const COVER_PLACEHOLDER_W = 320;
-const COVER_PLACEHOLDER_H = 180;
 
 /** Remember covers that already decoded so virtual remounts do not reload. */
 const coverLoadCache = new Set<string>();
 
 type CoverPriority = "high" | "normal";
-type CoverWaiter = {
-  priority: CoverPriority;
-  grant: (release: () => void) => void;
-};
-
-let coverActiveTotal = 0;
-let coverActiveLow = 0;
-const coverHighWaiters: CoverWaiter[] = [];
-const coverLowWaiters: CoverWaiter[] = [];
-
-function canStartCover(priority: CoverPriority): boolean {
-  if (coverActiveTotal >= COVER_TOTAL_MAX) return false;
-  if (priority === "normal" && coverActiveLow >= COVER_LOW_PRIORITY_MAX) {
-    return false;
-  }
-  return true;
-}
-
-function startCoverWaiter(waiter: CoverWaiter) {
-  coverActiveTotal += 1;
-  if (waiter.priority === "normal") coverActiveLow += 1;
-  let released = false;
-  waiter.grant(() => {
-    if (released) return;
-    released = true;
-    coverActiveTotal = Math.max(0, coverActiveTotal - 1);
-    if (waiter.priority === "normal") {
-      coverActiveLow = Math.max(0, coverActiveLow - 1);
-    }
-    flushCoverWaiters();
-  });
-}
-
-function flushCoverWaiters() {
-  while (coverHighWaiters.length > 0 && canStartCover("high")) {
-    const next = coverHighWaiters.shift();
-    if (next) startCoverWaiter(next);
-  }
-  while (coverLowWaiters.length > 0 && canStartCover("normal")) {
-    const next = coverLowWaiters.shift();
-    if (next) startCoverWaiter(next);
-  }
-}
-
-function acquireCoverSlot(priority: CoverPriority): Promise<() => void> {
-  return new Promise((resolve) => {
-    const waiter: CoverWaiter = { priority, grant: resolve };
-    if (canStartCover(priority)) {
-      startCoverWaiter(waiter);
-      return;
-    }
-    if (priority === "high") {
-      coverHighWaiters.unshift(waiter);
-    } else {
-      coverLowWaiters.push(waiter);
-    }
-  });
-}
-
-async function isPlaceholderThumb(url: string): Promise<boolean> {
-  try {
-    const res = await fetch(url, { method: "HEAD", cache: "no-store" });
-    return (res.headers.get("content-type") ?? "").includes("image/svg");
-  } catch {
-    return false;
-  }
-}
+type CoverState = "idle" | "loading" | "retrying" | "loaded";
 
 /** Netflix-style buffering ring for cover loading. */
 function NetflixSpinner() {
   return <div className="netflix-spinner" role="status" aria-label="加载中" />;
+}
+
+function isElementNearViewport(el: HTMLElement, rootMargin: string) {
+  const margin = Number.parseFloat(rootMargin) || 0;
+  const rect = el.getBoundingClientRect();
+  const width = window.innerWidth || document.documentElement.clientWidth;
+  const height = window.innerHeight || document.documentElement.clientHeight;
+  return (
+    rect.bottom >= -margin &&
+    rect.top <= height + margin &&
+    rect.right >= 0 &&
+    rect.left <= width
+  );
 }
 
 /** Load cover when near viewport; retry while visible if thumb is not ready yet. */
@@ -601,10 +561,12 @@ function LazyCover({
   fallbackClass = "poster-fallback",
   fallbackText = "No Cover",
   coverId,
+  aspectRatio,
   coverPriority = "normal",
   previewSourceId,
   previewHidden,
   onLoadingChange,
+  onReady,
 }: {
   src?: string;
   alt: string;
@@ -612,19 +574,23 @@ function LazyCover({
   fallbackClass?: string;
   fallbackText?: string;
   coverId?: string;
+  aspectRatio?: number;
   coverPriority?: CoverPriority;
   previewSourceId?: string;
   previewHidden?: boolean;
   onLoadingChange?: (id: string, loading: boolean) => void;
+  onReady?: (id: string) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const lazyRootMargin = useLazyRootMargin();
   const cachedCover = Boolean(src && coverLoadCache.has(src));
   const [inView, setInView] = useState(false);
-  const [ready, setReady] = useState(cachedCover);
-  const [imgLoaded, setImgLoaded] = useState(cachedCover);
+  const [coverState, setCoverState] = useState<CoverState>(
+    cachedCover ? "loaded" : "idle",
+  );
   const [retryAttempt, setRetryAttempt] = useState(0);
-  const releaseRef = useRef<(() => void) | null>(null);
+  const [retryWaiting, setRetryWaiting] = useState(false);
+  const [requestInFlight, setRequestInFlight] = useState(false);
   const retryTimerRef = useRef<number | null>(null);
   const inViewRef = useRef(false);
 
@@ -643,19 +609,19 @@ function LazyCover({
     }
   }
 
-  function releaseCoverSlot() {
-    releaseRef.current?.();
-    releaseRef.current = null;
-  }
-
   function requestRetry() {
     clearRetryTimer();
-    releaseCoverSlot();
-    setReady(false);
-    setImgLoaded(false);
-    if (!inViewRef.current || !src) return;
+    setRequestInFlight(false);
+    if (!src || previewHidden || !inViewRef.current) {
+      setCoverState("idle");
+      setRetryWaiting(false);
+      return;
+    }
+    setCoverState("retrying");
+    setRetryWaiting(true);
     retryTimerRef.current = window.setTimeout(() => {
       retryTimerRef.current = null;
+      setRetryWaiting(false);
       setRetryAttempt((n) => n + 1);
     }, coverPriority === "high" ? COVER_PRIORITY_RETRY_MS : COVER_RETRY_MS);
   }
@@ -665,18 +631,26 @@ function LazyCover({
   }, [inView]);
 
   useEffect(() => {
-    if (!src) return;
+    if (!src) {
+      setCoverState("idle");
+      setRetryAttempt(0);
+      setRetryWaiting(false);
+      setRequestInFlight(false);
+      clearRetryTimer();
+      return;
+    }
     if (coverLoadCache.has(src)) {
-      setReady(true);
-      setImgLoaded(true);
+      setCoverState("loaded");
+      setRetryWaiting(false);
+      setRequestInFlight(false);
       return;
     }
     setInView(false);
-    setReady(false);
-    setImgLoaded(false);
+    setCoverState("idle");
     setRetryAttempt(0);
+    setRetryWaiting(false);
+    setRequestInFlight(false);
     clearRetryTimer();
-    releaseCoverSlot();
   }, [src]);
 
   useEffect(() => {
@@ -688,80 +662,97 @@ function LazyCover({
       { rootMargin: lazyRootMargin },
     );
     io.observe(el);
-    return () => io.disconnect();
+    let raf = 0;
+    const checkVisibility = () => {
+      window.cancelAnimationFrame(raf);
+      raf = window.requestAnimationFrame(() => {
+        setInView(isElementNearViewport(el, lazyRootMargin));
+      });
+    };
+    checkVisibility();
+    window.addEventListener("scroll", checkVisibility, { passive: true });
+    window.addEventListener("resize", checkVisibility);
+    return () => {
+      window.cancelAnimationFrame(raf);
+      window.removeEventListener("scroll", checkVisibility);
+      window.removeEventListener("resize", checkVisibility);
+      io.disconnect();
+    };
   }, [src, lazyRootMargin]);
 
   useEffect(() => {
-    if (!inView) {
+    if (!inView || previewHidden) {
       clearRetryTimer();
-      if (!imgLoaded) {
-        releaseCoverSlot();
-        setReady(false);
-      }
+      setRetryWaiting(false);
+      setRequestInFlight(false);
+      if (coverState !== "loaded") setCoverState("idle");
       return;
     }
-    if (!src || ready || retryTimerRef.current != null || previewHidden) return;
-    let cancelled = false;
-    void acquireCoverSlot(coverPriority).then((release) => {
-      if (cancelled || !inViewRef.current || previewHidden) {
-        release();
-        return;
-      }
-      releaseRef.current = release;
-      setReady(true);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [src, inView, ready, retryAttempt, coverPriority, previewHidden, imgLoaded]);
+    if (!src || coverState === "loaded" || retryTimerRef.current != null) return;
+    const nextState = retryAttempt > 0 ? "retrying" : "loading";
+    if (coverState !== nextState) setCoverState(nextState);
+  }, [src, coverState, retryAttempt, previewHidden, inView]);
 
   useEffect(() => {
     return () => {
       clearRetryTimer();
-      releaseCoverSlot();
     };
   }, []);
 
-  async function handleLoad(img: HTMLImageElement) {
-    if (
-      img.naturalWidth === COVER_PLACEHOLDER_W &&
-      img.naturalHeight === COVER_PLACEHOLDER_H &&
-      (await isPlaceholderThumb(img.src))
-    ) {
-      requestRetry();
-      return;
-    }
-    releaseCoverSlot();
+  function handleLoad(img: HTMLImageElement) {
     clearRetryTimer();
+    setRequestInFlight(false);
+    setRetryWaiting(false);
     cacheCoverAspect(coverId, img);
     if (src) coverLoadCache.add(src);
-    setImgLoaded(true);
+    if (coverId) onReady?.(coverId);
+    setCoverState("loaded");
+  }
+
+  function handleError() {
+    requestRetry();
   }
 
   const hasSrc = Boolean(loadSrc);
   const cachedReady = Boolean(src && coverLoadCache.has(src));
-  const showImg = hasSrc && (ready || cachedReady);
-  const isLoading =
-    hasSrc && inView && !imgLoaded && !previewHidden && !cachedReady;
+  const loaded = coverState === "loaded" || cachedReady;
+  const shouldLoad = hasSrc && !loaded && !previewHidden && inView;
+  const showImg = hasSrc && (loaded || shouldLoad);
+  const isLoading = shouldLoad;
   const showLoadingFallback = isLoading;
-  const showFallback =
-    hasSrc && !imgLoaded && !cachedReady && !previewHidden;
-  const cachedAspect = coverId ? coverAspectCache.get(coverId) : undefined;
-  const lockedAspectStyle = cachedAspect
-    ? ({ aspectRatio: `1 / ${cachedAspect}` } as CSSProperties)
-    : undefined;
+  const showFallback = hasSrc && !loaded && !previewHidden;
+
+  useEffect(() => {
+    if (!shouldLoad || !loadSrc || retryWaiting) {
+      if (!shouldLoad || !loadSrc) setRequestInFlight(false);
+      return;
+    }
+
+    setRequestInFlight(true);
+  }, [loadSrc, retryWaiting, shouldLoad]);
+
+  const loadingLabel =
+    retryAttempt > 0 || coverState === "retrying"
+      ? "重试封面…"
+      : "加载封面…";
+  const knownAspect =
+    (coverId ? coverAspectCache.get(coverId) : undefined) ??
+    aspectRatio ??
+    DEFAULT_COVER_ASPECT;
+  const lockedAspectStyle = {
+    aspectRatio: `1 / ${knownAspect}`,
+  } as CSSProperties;
 
   useEffect(() => {
     if (!src || !coverLoadCache.has(src)) return;
-    setReady(true);
-    setImgLoaded(true);
+    setCoverState("loaded");
   }, [previewHidden, src]);
 
   useEffect(() => {
     if (!coverId || !onLoadingChange) return;
-    onLoadingChange(coverId, isLoading);
+    onLoadingChange(coverId, requestInFlight);
     return () => onLoadingChange(coverId, false);
-  }, [coverId, isLoading, onLoadingChange]);
+  }, [coverId, requestInFlight, onLoadingChange]);
 
   return (
     <div
@@ -779,7 +770,7 @@ function LazyCover({
         <img
           className={[
             "cover-img",
-            imgLoaded || cachedReady
+            loaded
               ? "cover-img--ready"
               : "cover-img--pending",
             className,
@@ -788,11 +779,10 @@ function LazyCover({
             .join(" ")}
           src={loadSrc}
           alt={alt}
-          loading="lazy"
           decoding="async"
           fetchPriority={coverPriority === "high" ? "high" : "low"}
-          onLoad={(e) => void handleLoad(e.currentTarget)}
-          onError={() => requestRetry()}
+          onLoad={(e) => handleLoad(e.currentTarget)}
+          onError={handleError}
         />
       )}
       {showFallback && (
@@ -800,6 +790,7 @@ function LazyCover({
           {showLoadingFallback ? (
             <span className="cover-loading-label">
               <NetflixSpinner />
+              <span>{loadingLabel}</span>
             </span>
           ) : (
             fallbackText
@@ -865,8 +856,12 @@ export default function App() {
   const [importDetail, setImportDetail] = useState("");
   const [downloadingCount, setDownloadingCount] = useState(0);
   const [queuedCount, setQueuedCount] = useState(0);
+  const [coverBuildingCount, setCoverBuildingCount] = useState(0);
+  const [coverQueuedCount, setCoverQueuedCount] = useState(0);
   const [coverLoadingCount, setCoverLoadingCount] = useState(0);
   const coverLoadingRef = useRef(new Set<string>());
+  const coverReadyIdsRef = useRef(new Set<string>());
+  const [coverReadyVersion, setCoverReadyVersion] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -881,13 +876,24 @@ export default function App() {
   const [previewTransitionMode, setPreviewTransitionMode] =
     useState<PreviewTransitionMode>("zoom");
   const [previewClosing, setPreviewClosing] = useState(false);
+  const [cardOverlayHiddenId, setCardOverlayHiddenId] = useState<string | null>(
+    null,
+  );
   const [playError, setPlayError] = useState("");
+  const pendingOpenTimerRef = useRef<number | null>(null);
+  const pendingOpenTokenRef = useRef(0);
 
   const onCoverLoadingChange = useCallback((id: string, loading: boolean) => {
     const set = coverLoadingRef.current;
     if (loading) set.add(id);
     else set.delete(id);
     setCoverLoadingCount(set.size);
+  }, []);
+  const onCoverReady = useCallback((id: string) => {
+    const set = coverReadyIdsRef.current;
+    if (set.has(id)) return;
+    set.add(id);
+    setCoverReadyVersion((version) => version + 1);
   }, []);
   const applyPayload = (payload: ItemsPayload) => {
     setItems(payload.items ?? []);
@@ -901,6 +907,8 @@ export default function App() {
     setImportDetail(payload.import_detail ?? "");
     setDownloadingCount(payload.downloading_count ?? 0);
     setQueuedCount(payload.queued_count ?? 0);
+    setCoverBuildingCount(payload.cover_building_count ?? 0);
+    setCoverQueuedCount(payload.cover_queued_count ?? 0);
     setApiReady(true);
   };
 
@@ -945,6 +953,10 @@ export default function App() {
     [displayItems],
   );
   const mediaItems = useMemo(() => [...videos, ...images], [videos, images]);
+  const previewMediaItems = useMemo(
+    () => displayItems.filter((i) => i.type === "video" || i.type === "image"),
+    [displayItems],
+  );
   const [viewportBackgroundItems, setViewportBackgroundItems] = useState<Item[]>(
     [],
   );
@@ -1011,6 +1023,14 @@ export default function App() {
     };
   }, []);
 
+  useEffect(() => {
+    return () => {
+      if (pendingOpenTimerRef.current != null) {
+        window.clearTimeout(pendingOpenTimerRef.current);
+      }
+    };
+  }, []);
+
   const effectiveBackgroundItems = useMemo(() => {
     if (viewportBackgroundItems.length === 0) return mediaItems;
 
@@ -1021,11 +1041,19 @@ export default function App() {
 
     return freshViewportItems.length > 0 ? freshViewportItems : mediaItems;
   }, [mediaItems, viewportBackgroundItems]);
+  const backgroundReadyItems = useMemo(
+    () =>
+      effectiveBackgroundItems.filter((item) =>
+        coverReadyIdsRef.current.has(item.id),
+      ),
+    [coverReadyVersion, effectiveBackgroundItems],
+  );
   const livePlayer = useMemo(() => {
     if (!player) return null;
     const fresh = items.find((i) => i.id === player.item.id);
     return fresh ? { ...player, item: fresh } : player;
   }, [player, items]);
+  const chromeCollapsed = Boolean(livePlayer || cardOverlayHiddenId);
 
   // Prefer item.error from SSE as the single play-failure message.
   useEffect(() => {
@@ -1092,18 +1120,49 @@ export default function App() {
     return Number.isFinite(rotation) ? rotation : 0;
   }
 
+  function clearPendingOpen() {
+    if (pendingOpenTimerRef.current != null) {
+      window.clearTimeout(pendingOpenTimerRef.current);
+      pendingOpenTimerRef.current = null;
+    }
+    pendingOpenTokenRef.current += 1;
+  }
+
   function openPlayer(
     kind: "video" | "image",
     item: Item,
     target: HTMLElement,
     transitionMode: PreviewTransitionMode = "zoom",
   ) {
+    clearPendingOpen();
     setPlayError("");
     setPreviewClosing(false);
+    setCardOverlayHiddenId(kind === "video" ? item.id : null);
     setPreviewTransitionMode(transitionMode);
     setPreviewOrigin(getPreviewSourceEl(target).getBoundingClientRect());
     setPreviewOriginRotation(getPreviewRotation(target));
     setPlayer({ kind, item });
+  }
+
+  function openVideoPlayer(item: Item, target: HTMLElement) {
+    clearPendingOpen();
+    const token = pendingOpenTokenRef.current;
+    const originRect = getPreviewSourceEl(target).getBoundingClientRect();
+    const originRotation = getPreviewRotation(target);
+    setPlayError("");
+    setPreviewClosing(false);
+    setCardOverlayHiddenId(item.id);
+    const delay = window.matchMedia("(prefers-reduced-motion: reduce)").matches
+      ? 0
+      : CARD_OVERLAY_SLIDE_MS;
+    pendingOpenTimerRef.current = window.setTimeout(() => {
+      if (token !== pendingOpenTokenRef.current) return;
+      pendingOpenTimerRef.current = null;
+      setPreviewTransitionMode("zoom");
+      setPreviewOrigin(originRect);
+      setPreviewOriginRotation(originRotation);
+      setPlayer({ kind: "video", item });
+    }, delay);
   }
 
   function openPlayerFromRect(
@@ -1112,12 +1171,21 @@ export default function App() {
     originRect: DOMRectReadOnly,
     transitionMode: PreviewTransitionMode = "zoom",
   ) {
+    clearPendingOpen();
     setPlayError("");
     setPreviewClosing(false);
+    setCardOverlayHiddenId(kind === "video" ? item.id : null);
     setPreviewTransitionMode(transitionMode);
     setPreviewOrigin(originRect);
     setPreviewOriginRotation(0);
     setPlayer({ kind, item });
+  }
+
+  function navigatePlayer(item: Item) {
+    setPlayError("");
+    setPreviewClosing(false);
+    setCardOverlayHiddenId(item.type === "video" ? item.id : null);
+    setPlayer({ kind: item.type === "image" ? "image" : "video", item });
   }
 
   function requestClosePlayer() {
@@ -1131,6 +1199,7 @@ export default function App() {
     setPreviewTransitionMode("zoom");
     setPreviewClosing(false);
     setPlayError("");
+    window.requestAnimationFrame(() => setCardOverlayHiddenId(null));
   }
 
   function openFilmPlayer({ item, originRect }: FilmClickDetail) {
@@ -1144,16 +1213,16 @@ export default function App() {
 
   return (
     <>
-      {apiReady && effectiveBackgroundItems.length > 0 && (
+      {apiReady && backgroundReadyItems.length > 0 && (
         <FilmBackground
-          items={effectiveBackgroundItems}
+          items={backgroundReadyItems}
           onItemClick={openFilmPlayer}
         />
       )}
       <header
         className={[
           "topbar",
-          livePlayer && !previewClosing ? "topbar--collapsed" : "",
+          chromeCollapsed ? "topbar--collapsed" : "",
         ]
           .filter(Boolean)
           .join(" ")}
@@ -1162,27 +1231,30 @@ export default function App() {
           <div className="brand">
             tdl <span>PREVIEW</span>
           </div>
-          <div className="stats">
-            {items.length} 项 · {done} 已完成
-          </div>
+          <StatusBar
+            apiReady={apiReady}
+            importing={importing}
+            importPhase={importPhase}
+            importSource={importSource}
+            importDetail={importDetail}
+            importDone={importDone}
+            importTotal={importTotal}
+            importItems={importItems}
+            downloadingCount={downloadingCount}
+            queuedCount={queuedCount}
+            coverBuildingCount={coverBuildingCount}
+            coverQueuedCount={coverQueuedCount}
+            coverLoadingCount={coverLoadingCount}
+            itemCount={items.length}
+            completedCount={done}
+          />
         </div>
       </header>
-      <div className="app">
-
-      <StatusBar
-        apiReady={apiReady}
-        importing={importing}
-        importPhase={importPhase}
-        importSource={importSource}
-        importDetail={importDetail}
-        importDone={importDone}
-        importTotal={importTotal}
-        importItems={importItems}
-        downloadingCount={downloadingCount}
-        queuedCount={queuedCount}
-        coverLoadingCount={coverLoadingCount}
-        itemCount={items.length}
-      />
+      <div
+        className={["app", chromeCollapsed ? "app--chrome-collapsed" : ""]
+          .filter(Boolean)
+          .join(" ")}
+      >
 
       <DownloadDock items={items} />
 
@@ -1247,7 +1319,7 @@ export default function App() {
         <>
       {apiReady && (
         <ScrollRail
-          collapsed={Boolean(livePlayer && !previewClosing)}
+          collapsed={chromeCollapsed}
           videos={videos}
           images={images}
           files={files}
@@ -1277,22 +1349,36 @@ export default function App() {
                   type="button"
                   className="card"
                   onClick={(e) =>
-                    openPlayer("video", item, e.currentTarget)
+                    openVideoPlayer(item, e.currentTarget)
                   }
                 >
-                  <StatusBadge item={item} />
+                  <StatusBadge
+                    item={item}
+                    maxQueuePos={VIDEO_QUEUE_DISPLAY_LIMIT}
+                  />
                   <div className="card-cover">
                     <LazyCover
                       className="poster"
                       src={coverURL(item.cover || item.thumb_url)}
                       alt={displayName(item)}
                       coverId={item.id}
+                      aspectRatio={item.cover_aspect}
                       coverPriority="high"
                       previewSourceId={item.id}
                       previewHidden={livePlayer?.item.id === item.id}
                       onLoadingChange={onCoverLoadingChange}
+                      onReady={onCoverReady}
                     />
-                    <div className="card-overlay">
+                    <div
+                      className={[
+                        "card-overlay",
+                        cardOverlayHiddenId === item.id
+                          ? "card-overlay--hidden"
+                          : "",
+                      ]
+                        .filter(Boolean)
+                        .join(" ")}
+                    >
                       <div className="card-title">{displayName(item)}</div>
                       <div className="card-meta">
                         <div className="card-sub">
@@ -1305,7 +1391,11 @@ export default function App() {
                             .join(" · ")}
                         </div>
                         {item.status === "queued" && (
-                          <div className="card-status">{statusLabel(item)}</div>
+                          <div className="card-status">
+                            {(item.queue_pos ?? 0) > VIDEO_QUEUE_DISPLAY_LIMIT
+                              ? "未下载"
+                              : statusLabel(item)}
+                          </div>
                         )}
                       </div>
                       {(item.status === "caching" ||
@@ -1358,9 +1448,11 @@ export default function App() {
                   src={coverURL(item.thumb_url || item.preview_url)}
                   alt={displayName(item)}
                   coverId={item.id}
+                  aspectRatio={item.cover_aspect}
                   previewSourceId={item.id}
                   previewHidden={livePlayer?.item.id === item.id}
                   onLoadingChange={onCoverLoadingChange}
+                  onReady={onCoverReady}
                 />
               </button>
             )}
@@ -1438,10 +1530,14 @@ export default function App() {
               livePlayer.item.thumb_url ||
               livePlayer.item.preview_url,
           )}
-          aspectRatio={coverAspectCache.get(livePlayer.item.id)}
+          aspectRatio={
+            coverAspectCache.get(livePlayer.item.id) ?? livePlayer.item.cover_aspect
+          }
           closing={previewClosing}
+          mediaItems={previewMediaItems}
           playError={playError}
           onPlayError={setPlayError}
+          onNavigate={navigatePlayer}
           onCloseRequest={requestClosePlayer}
           onClosed={finalizeClosePlayer}
           onPause={onPause}
@@ -1451,7 +1547,13 @@ export default function App() {
   );
 }
 
-function StatusBadge({ item }: { item: Item }) {
+function StatusBadge({
+  item,
+  maxQueuePos,
+}: {
+  item: Item;
+  maxQueuePos?: number;
+}) {
   if (item.status === "completed") {
     return null;
   }
@@ -1461,8 +1563,12 @@ function StatusBadge({ item }: { item: Item }) {
   if (item.status === "error") {
     return <span className="badge busy">错误</span>;
   }
-  if ((item.queue_pos ?? 0) > 0) {
-    return <span className="badge queue">排队 #{item.queue_pos}</span>;
+  const queuePos = item.queue_pos ?? 0;
+  const showQueue =
+    queuePos > 0 &&
+    (maxQueuePos === undefined || queuePos <= maxQueuePos);
+  if (showQueue) {
+    return <span className="badge queue">排队 #{queuePos}</span>;
   }
   if (item.status === "paused") {
     return <span className="badge paused">{progressPct(item)}%</span>;

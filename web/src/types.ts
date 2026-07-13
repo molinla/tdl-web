@@ -24,6 +24,7 @@ export interface Item {
   target_path: string;
   thumb_url?: string;
   cover?: string;
+  cover_aspect?: number;
   preview_url?: string;
   stream_url?: string;
   download_url: string;
@@ -46,6 +47,8 @@ export interface ItemsPayload {
   import_detail?: string;
   downloading_count?: number;
   queued_count?: number;
+  cover_building_count?: number;
+  cover_queued_count?: number;
 }
 
 export type RangeType = "" | "id" | "time";
