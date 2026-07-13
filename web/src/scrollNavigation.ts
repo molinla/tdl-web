@@ -71,22 +71,6 @@ function dateBounds(items: RailItem[]): {
   return { min, max, count };
 }
 
-function sectionTimelineWeight(items: RailItem[]): number {
-  const bounds = dateBounds(items);
-  if (
-    bounds.count >= 2 &&
-    bounds.min != null &&
-    bounds.max != null &&
-    bounds.max > bounds.min
-  ) {
-    return bounds.max - bounds.min;
-  }
-
-  // Fallback for legacy/missing dates: keep the rail useful instead of
-  // collapsing everything into one marker.
-  return items.length;
-}
-
 function formatRailDate(unix: number): string {
   const d = new Date(unix * 1000);
   const y = d.getFullYear();
@@ -153,63 +137,13 @@ function splitIntoEvenCount(
   return batches;
 }
 
-function splitIntoTimeline(
-  items: RailItem[],
-  batchCount: number,
-  sectionId: string,
-): ScrollBatch[] {
-  if (items.length === 0 || batchCount <= 0) return [];
-
-  const slots = Math.min(batchCount, items.length);
-  const bounds = dateBounds(items);
-  if (
-    slots <= 1 ||
-    bounds.count < 2 ||
-    bounds.min == null ||
-    bounds.max == null ||
-    bounds.max <= bounds.min
-  ) {
-    return splitIntoEvenCount(items, slots, sectionId);
-  }
-
-  const minDate = bounds.min;
-  const maxDate = bounds.max;
-  const span = maxDate - minDate;
-  const slotSize = span / slots;
-  if (slotSize <= 0) return splitIntoEvenCount(items, slots, sectionId);
-
-  const groups: RailItem[][] = [];
-  let currentSlot: number | null = null;
-
-  for (const item of items) {
-    const date = validMessageDate(item);
-    const slot: number =
-      date == null
-        ? (currentSlot ?? 0)
-        : Math.min(
-            slots - 1,
-            Math.max(0, Math.floor((maxDate - date) / slotSize)),
-          );
-
-    if (currentSlot !== slot) {
-      groups.push([]);
-      currentSlot = slot;
-    }
-    groups[groups.length - 1]?.push(item);
-  }
-
-  return groups
-    .map((group, index) => makeBatch(sectionId, index, group))
-    .filter((batch): batch is ScrollBatch => batch != null);
-}
-
 function allocateBatchSlots(sections: RailItem[][], totalSlots: number): number[] {
   const slots = sections.map(() => 0);
   const active = sections
     .map((items, index) => ({
       index,
       cap: items.length,
-      weight: sectionTimelineWeight(items),
+      weight: items.length,
     }))
     .filter((entry) => entry.cap > 0);
 
@@ -304,7 +238,7 @@ function fitBatchSlots(
   const sectionCount = sections.length;
   const targetTotal = maxBatchSlotsForViewport(viewportHeight, sectionCount);
   const slots = allocateBatchSlots(sections, targetTotal);
-  const weights = sections.map(sectionTimelineWeight);
+  const weights = sections.map((items) => items.length);
   const minSlots = sections.map((items) => (items.length > 0 ? 1 : 0));
 
   while (totalRailHeight(slots, sectionCount) > viewportHeight * RAIL_HEIGHT_RATIO) {
@@ -345,7 +279,7 @@ export function buildRailLayout(
     id: section.id,
     label: section.label,
     items: section.items,
-    batches: splitIntoTimeline(
+    batches: splitIntoEvenCount(
       section.items,
       batchSlots[sectionIndex] ?? 0,
       section.id,
