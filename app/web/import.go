@@ -261,6 +261,7 @@ func (s *Server) importFromJSONFiles(ctx context.Context, files []string, rangeT
 				Date:        meta.Date,
 				Status:      statusQueued,
 				TargetPath:  targetPath,
+				CoverAspect: aspectFromSize(meta.Width, meta.Height),
 				DownloadURL: "/api/items/" + id + "/download",
 			}
 			switch item.Type {
@@ -393,6 +394,7 @@ func (s *Server) importFromURLs(ctx context.Context, urls []string, rangeType st
 				Date:        int64(msg.Date),
 				Status:      statusQueued,
 				TargetPath:  targetPath,
+				CoverAspect: coverAspect(main, thumb),
 				DownloadURL: "/api/items/" + id + "/download",
 				media:       main,
 				thumb:       thumb,

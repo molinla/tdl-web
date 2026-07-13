@@ -12,6 +12,7 @@ func GetDocumentInfo(doc *tg.MessageMediaDocument) (*Media, bool) {
 	if !ok {
 		return nil, false
 	}
+	width, height, supportsStreaming, preloadPrefixSize := getDocumentVideoInfo(d)
 
 	return &Media{
 		InputFileLoc: &tg.InputDocumentFileLocation{
@@ -19,11 +20,28 @@ func GetDocumentInfo(doc *tg.MessageMediaDocument) (*Media, bool) {
 			AccessHash:    d.AccessHash,
 			FileReference: d.FileReference,
 		},
-		Name: GetDocumentName(d),
-		Size: d.Size,
-		DC:   d.DCID,
-		Date: int64(d.Date),
+		Name:              GetDocumentName(d),
+		Size:              d.Size,
+		Width:             width,
+		Height:            height,
+		DC:                d.DCID,
+		Date:              int64(d.Date),
+		SupportsStreaming: supportsStreaming,
+		PreloadPrefixSize: preloadPrefixSize,
 	}, true
+}
+
+func getDocumentVideoInfo(doc *tg.Document) (int, int, bool, int) {
+	for _, attr := range doc.Attributes {
+		switch a := attr.(type) {
+		case *tg.DocumentAttributeVideo:
+			preload, _ := a.GetPreloadPrefixSize()
+			return a.W, a.H, a.GetSupportsStreaming(), preload
+		case *tg.DocumentAttributeImageSize:
+			return a.W, a.H, false, 0
+		}
+	}
+	return 0, 0, false, 0
 }
 
 func GetDocumentName(doc *tg.Document) string {

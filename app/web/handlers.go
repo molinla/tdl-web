@@ -15,6 +15,7 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/gorilla/mux"
 	"github.com/gotd/contrib/http_io"
+	"github.com/gotd/contrib/http_range"
 	"github.com/gotd/contrib/partio"
 	"github.com/gotd/contrib/tg_io"
 	tgdownloader "github.com/gotd/td/telegram/downloader"
@@ -25,6 +26,8 @@ import (
 	"github.com/iyear/tdl/pkg/consts"
 )
 
+const streamChunkMaxBytes = 32 * 1024 * 1024
+
 func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, s.snapshot())
 }
@@ -32,21 +35,24 @@ func (s *Server) handleItems(w http.ResponseWriter, r *http.Request) {
 func (s *Server) snapshot() map[string]any {
 	queuePos := s.queuePositions()
 	downloading, queued := s.downloadActivityCounts()
+	coverBuilding, coverQueued := s.coverActivityCounts()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	return map[string]any{
-		"fingerprint":       s.fingerprint,
-		"items":             s.itemListLocked(queuePos),
-		"importing":         s.importing,
-		"import_error":      s.importError,
-		"import_total":      s.importTotal,
-		"import_done":       s.importDone,
-		"import_items":      len(s.order),
-		"import_phase":      s.importPhase,
-		"import_source":     s.importSource,
-		"import_detail":     s.importDetail,
-		"downloading_count": downloading,
-		"queued_count":      queued,
+		"fingerprint":          s.fingerprint,
+		"items":                s.itemListLocked(queuePos),
+		"importing":            s.importing,
+		"import_error":         s.importError,
+		"import_total":         s.importTotal,
+		"import_done":          s.importDone,
+		"import_items":         len(s.order),
+		"import_phase":         s.importPhase,
+		"import_source":        s.importSource,
+		"import_detail":        s.importDetail,
+		"downloading_count":    downloading,
+		"queued_count":         queued,
+		"cover_building_count": coverBuilding,
+		"cover_queued_count":   coverQueued,
 	}
 }
 
@@ -282,89 +288,52 @@ func (s *Server) handleThumb(ctx context.Context) http.HandlerFunc {
 			}
 		}
 
-		// 4) Telegram document thumb only (never video main body).
+		// 4–5) Telegram thumb / remote poster via isolated cover queue.
 		if itemStatus == statusError {
 			s.resetItemError(id)
 		}
 		resolved, ensureErr := s.ensureMedia(ctx, id)
 		if ensureErr != nil {
 			s.markItemError(id, ensureErr)
-			serveThumbPlaceholder(w)
+			serveThumbUnavailable(w)
 			return
 		}
 		if resolved != nil && resolved.thumb != nil {
 			thumb := resolved.thumb
 			if itemType == mediaImage && sameMediaPayload(thumb, resolved.media) {
-				// For image media without a separate thumbnail, display by streaming the
-				// image immediately below; cache warming stays in the background.
-			} else {
-				if thumb.Size <= thumbCacheMaxBytes {
-					err := s.ensureThumbCache("thumb:"+id, thumbPath, func() error {
-						if !s.acquireTGSharedForCover(r.Context(), retryRequest) {
-							// Fail-fast: do not hold a browser socket waiting on Telegram.
-							return errors.New("telegram media busy")
-						}
-						defer s.releaseTGShared()
-						return s.cacheMediaFile(ctx, thumb, thumbPath)
-					})
-					if err == nil && validThumbCacheFile(thumbPath) {
-						if f, err := os.Open(thumbPath); err == nil {
-							defer f.Close()
-							setMediaCacheHeaders(w)
-							serveLocalFile(w, r, f, id+".jpg", "image/jpeg")
-							return
-						}
-					}
-					serveThumbPlaceholder(w)
-					return
-				}
-				if itemType != mediaImage {
-					serveThumbPlaceholder(w)
-					return
-				}
+				// Stream image below; cache warming uses cover queue.
+			} else if thumb.Size > thumbCacheMaxBytes && itemType != mediaImage {
+				serveThumbUnavailable(w)
+				return
+			} else if s.tryServeTelegramCover(w, r, ctx, id, itemType, resolved, retryRequest) {
+				return
+			} else if itemType != mediaImage {
+				serveThumbUnavailable(w)
+				return
 			}
-		}
-
-		// 5) Undownloaded video with no TG thumb: fetch only a prefix and extract a frame.
-		if itemType == mediaVideo && resolved != nil && resolved.media != nil {
-			err := s.ensureThumbCache("thumb:"+id, thumbPath, func() error {
-				if !s.acquireTGSharedForCover(r.Context(), retryRequest) {
-					return errors.New("telegram media busy")
-				}
-				defer s.releaseTGShared()
-				return s.extractRemoteVideoPoster(ctx, resolved.media, thumbPath)
-			})
-			if err == nil && validThumbCacheFile(thumbPath) {
-				if f, err := os.Open(thumbPath); err == nil {
-					defer f.Close()
-					setMediaCacheHeaders(w)
-					serveLocalFile(w, r, f, id+".jpg", "image/jpeg")
-					return
-				}
+		} else if itemType == mediaVideo && resolved != nil && resolved.media != nil {
+			if s.tryServeTelegramCover(w, r, ctx, id, itemType, resolved, retryRequest) {
+				return
 			}
 		}
 
 		// 6) Image without local file: stream image media (not video).
 		if itemType == mediaImage && resolved != nil && resolved.media != nil {
-			if !s.acquireTGSharedForCover(r.Context(), retryRequest) {
-				serveThumbPlaceholder(w)
+			src := resolved.media
+			if src.Size <= thumbCacheMaxBytes {
+				s.enqueueCoverBuild(id, retryRequest)
+			}
+			if !s.tryAcquireTGShared() {
+				serveThumbUnavailable(w)
 				return
 			}
 			defer s.releaseTGShared()
-			src := resolved.media
-			if src.Size <= thumbCacheMaxBytes {
-				go func() {
-					_ = s.ensureThumbCache("thumb:"+id, thumbPath, func() error {
-						return s.cacheMediaFile(ctx, src, thumbPath)
-					})
-				}()
-			}
 			setMediaCacheHeaders(w)
 			s.serveTelegramMedia(ctx, src, w, r, false)
 			return
 		}
 
-		serveThumbPlaceholder(w)
+		serveThumbUnavailable(w)
 	}
 }
 
@@ -447,15 +416,19 @@ func (s *Server) handleStream(ctx context.Context) http.HandlerFunc {
 		}
 		target := item.TargetPath
 		mime := item.MIME
+		size := item.Size
 		s.mu.RUnlock()
 		if f, err := os.Open(target); err == nil {
 			defer f.Close()
-			setMediaCacheHeaders(w)
-			serveLocalFile(w, r, f, filepath.Base(target), mime)
+			serveStreamFile(w, r, f, filepath.Base(target), mime)
 			return
 		}
-		if serveTmpRange(w, r, target+tempExt, mime, item.Size) {
-			s.startDownloadNow(id)
+		if serveTmpRange(w, r, target+tempExt, mime, size) {
+			if tmpComplete(target, size) {
+				go s.promoteCompletedTmp(id)
+			} else {
+				s.startDownloadNow(id)
+			}
 			return
 		}
 
@@ -479,12 +452,37 @@ func (s *Server) handleStream(ctx context.Context) http.HandlerFunc {
 			return
 		}
 		defer release()
-		s.serveTelegramMedia(ctx, resolved.media, w, r, true)
+		s.serveTelegramStream(ctx, resolved.media, w, r)
 	}
 }
 
+func (s *Server) promoteCompletedTmp(id string) {
+	ctx := s.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	s.mu.RLock()
+	item := s.items[id]
+	if item == nil {
+		s.mu.RUnlock()
+		return
+	}
+	target := item.TargetPath
+	size := item.Size
+	logical := item.LogicalPos
+	s.mu.RUnlock()
+
+	promoted, err := promoteTmp(target, size)
+	if err != nil || !promoted {
+		return
+	}
+	s.markCompleted(ctx, id, logical, size)
+	_ = s.saveFinishedOrClear(context.Background())
+	_ = s.saveMetaCache()
+}
+
 func serveTmpRange(w http.ResponseWriter, r *http.Request, tmpPath, mime string, fullSize int64) bool {
-	if fullSize <= 0 || r.Header.Get("Range") == "" {
+	if fullSize <= 0 {
 		return false
 	}
 	f, err := os.Open(tmpPath)
@@ -496,55 +494,36 @@ func serveTmpRange(w http.ResponseWriter, r *http.Request, tmpPath, mime string,
 	if err != nil || st.Size() <= 0 {
 		return false
 	}
-	start, end, ok := parseTmpRange(r.Header.Get("Range"), st.Size(), fullSize)
+	spec, ok, status, err := boundedTmpRange(r.Header.Get("Range"), st.Size(), fullSize)
+	if err != nil {
+		writeRangeError(w, status, fullSize, err)
+		return true
+	}
 	if !ok {
 		return false
 	}
-	if _, err := f.Seek(start, io.SeekStart); err != nil {
+	if _, err := f.Seek(spec.start, io.SeekStart); err != nil {
 		return false
 	}
-	n := end - start + 1
 	if mime != "" {
 		w.Header().Set("Content-Type", mime)
 	}
 	w.Header().Set("Accept-Ranges", "bytes")
-	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, fullSize))
-	w.Header().Set("Content-Length", strconv.FormatInt(n, 10))
-	w.WriteHeader(http.StatusPartialContent)
+	setStreamCacheHeaders(w)
+	if spec.partial {
+		w.Header().Set("Content-Range", spec.contentRange(fullSize))
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(spec.length, 10))
+	if spec.partial {
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
 	if r.Method == http.MethodHead {
 		return true
 	}
-	_, _ = io.CopyN(w, f, n)
+	_, _ = io.CopyN(w, f, spec.length)
 	return true
-}
-
-func parseTmpRange(header string, tmpSize, fullSize int64) (int64, int64, bool) {
-	if tmpSize <= 0 || fullSize <= 0 || !strings.HasPrefix(header, "bytes=") || strings.Contains(header, ",") {
-		return 0, 0, false
-	}
-	parts := strings.SplitN(strings.TrimPrefix(header, "bytes="), "-", 2)
-	if len(parts) != 2 || parts[0] == "" {
-		return 0, 0, false
-	}
-	start, err := strconv.ParseInt(parts[0], 10, 64)
-	if err != nil || start < 0 || start >= tmpSize || start >= fullSize {
-		return 0, 0, false
-	}
-	end := tmpSize - 1
-	if parts[1] != "" {
-		parsedEnd, err := strconv.ParseInt(parts[1], 10, 64)
-		if err != nil || parsedEnd < start {
-			return 0, 0, false
-		}
-		if parsedEnd < end {
-			end = parsedEnd
-		}
-	}
-	if fullSize-1 < end {
-		end = fullSize - 1
-	}
-	return start, end, start <= end
 }
 
 func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
@@ -639,23 +618,6 @@ func (s *Server) releaseTGShared() {
 	}
 }
 
-func (s *Server) acquireTGSharedForCover(ctx context.Context, retry bool) bool {
-	if !retry {
-		return s.tryAcquireTGShared()
-	}
-	s.ensureTGServe()
-	timer := time.NewTimer(1500 * time.Millisecond)
-	defer timer.Stop()
-	select {
-	case s.tgShared <- struct{}{}:
-		return true
-	case <-timer.C:
-		return false
-	case <-ctx.Done():
-		return false
-	}
-}
-
 // acquireTGStream prefers the reserved stream slot, then falls back to shared.
 func (s *Server) acquireTGStream(ctx context.Context) (func(), error) {
 	s.ensureTGServe()
@@ -695,6 +657,32 @@ func (s *Server) serveTelegramMedia(ctx context.Context, m *media, w http.Respon
 		WithContentType(m.MIME).
 		WithLog(logctx.From(ctx).Named("web-stream")).
 		ServeHTTP(w, r)
+}
+
+func (s *Server) serveTelegramStream(ctx context.Context, m *media, w http.ResponseWriter, r *http.Request) {
+	if m == nil {
+		http.Error(w, "media unavailable", http.StatusNotFound)
+		return
+	}
+	spec, ok := prepareStreamResponse(w, r, m.Size, m.MIME, m.Name)
+	if !ok || r.Method == http.MethodHead || spec.length <= 0 {
+		return
+	}
+	api := s.pool.Client(ctx, m.DC)
+	if s.opts.Takeout {
+		api = s.pool.Takeout(ctx, m.DC)
+	}
+	partSize := int64(viper.GetInt(consts.FlagPartSize))
+	if partSize < 1024 || partSize > 1024*1024 || partSize%1024 != 0 {
+		partSize = 512 * 1024
+	}
+	u := partio.NewStreamer(
+		tg_io.NewDownloader(api).ChunkSource(m.Size, m.Location),
+		partSize)
+	err := u.StreamAt(r.Context(), spec.start, &limitedStreamWriter{w: w, n: spec.length})
+	if err != nil && !errors.Is(err, io.EOF) && !errors.Is(err, context.Canceled) {
+		logctx.From(ctx).Named("web-stream").Error("Failed to stream")
+	}
 }
 
 func (s *Server) thumbCachePath(id string) string {
@@ -776,10 +764,13 @@ func setMediaCacheHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
 }
 
-func serveThumbPlaceholder(w http.ResponseWriter) {
-	w.Header().Set("Content-Type", "image/svg+xml")
+func setStreamCacheHeaders(w http.ResponseWriter) {
 	w.Header().Set("Cache-Control", "no-store")
-	_, _ = io.WriteString(w, placeholderSVG)
+}
+
+func serveThumbUnavailable(w http.ResponseWriter) {
+	w.Header().Set("Cache-Control", "no-store")
+	http.Error(w, "thumbnail not ready", http.StatusServiceUnavailable)
 }
 
 func serveLocalFile(w http.ResponseWriter, r *http.Request, f *os.File, name, mime string) {
@@ -792,4 +783,132 @@ func serveLocalFile(w http.ResponseWriter, r *http.Request, f *os.File, name, mi
 		mod = stat.ModTime()
 	}
 	http.ServeContent(w, r, name, mod, f)
+}
+
+type streamSpec struct {
+	start   int64
+	length  int64
+	partial bool
+}
+
+func (s streamSpec) contentRange(size int64) string {
+	return fmt.Sprintf("bytes %d-%d/%d", s.start, s.start+s.length-1, size)
+}
+
+func boundedStreamRange(header string, size int64) (streamSpec, int, error) {
+	if size < 0 {
+		return streamSpec{}, http.StatusBadRequest, http_range.ErrInvalid
+	}
+	if size == 0 {
+		return streamSpec{}, http.StatusOK, nil
+	}
+	ranges, err := http_range.ParseRange(header, size)
+	if err != nil {
+		if errors.Is(err, http_range.ErrNoOverlap) {
+			return streamSpec{}, http.StatusRequestedRangeNotSatisfiable, err
+		}
+		return streamSpec{}, http.StatusBadRequest, err
+	}
+	if len(ranges) > 1 {
+		return streamSpec{}, http.StatusRequestedRangeNotSatisfiable, http_range.ErrInvalid
+	}
+
+	spec := streamSpec{length: size}
+	if len(ranges) == 1 {
+		spec.start = ranges[0].Start
+		spec.length = ranges[0].Length
+		spec.partial = true
+	}
+	if spec.length > streamChunkMaxBytes {
+		spec.length = streamChunkMaxBytes
+		spec.partial = true
+	}
+	return spec, http.StatusOK, nil
+}
+
+func boundedTmpRange(header string, tmpSize, fullSize int64) (streamSpec, bool, int, error) {
+	spec, status, err := boundedStreamRange(header, fullSize)
+	if err != nil {
+		return streamSpec{}, false, status, err
+	}
+	if spec.start >= tmpSize {
+		return streamSpec{}, false, http.StatusOK, nil
+	}
+	if spec.start+spec.length > tmpSize {
+		spec.length = tmpSize - spec.start
+		spec.partial = true
+	}
+	return spec, spec.length > 0, http.StatusOK, nil
+}
+
+func writeRangeError(w http.ResponseWriter, status int, size int64, err error) {
+	if status == http.StatusRequestedRangeNotSatisfiable {
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes */%d", size))
+	}
+	http.Error(w, err.Error(), status)
+}
+
+func prepareStreamResponse(w http.ResponseWriter, r *http.Request, size int64, mime, name string) (streamSpec, bool) {
+	spec, status, err := boundedStreamRange(r.Header.Get("Range"), size)
+	if err != nil {
+		writeRangeError(w, status, size, err)
+		return streamSpec{}, false
+	}
+	if mime != "" {
+		w.Header().Set("Content-Type", mime)
+	}
+	if name != "" {
+		w.Header().Set("Content-Disposition", fmt.Sprintf(`inline; filename="%s"`, strings.ReplaceAll(name, `"`, `'`)))
+	}
+	w.Header().Set("Accept-Ranges", "bytes")
+	setStreamCacheHeaders(w)
+	if spec.partial {
+		w.Header().Set("Content-Range", spec.contentRange(size))
+	}
+	w.Header().Set("Content-Length", strconv.FormatInt(spec.length, 10))
+	if spec.partial {
+		w.WriteHeader(http.StatusPartialContent)
+	} else {
+		w.WriteHeader(http.StatusOK)
+	}
+	return spec, true
+}
+
+func serveStreamFile(w http.ResponseWriter, r *http.Request, f *os.File, name, mime string) {
+	stat, err := f.Stat()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	spec, ok := prepareStreamResponse(w, r, stat.Size(), mime, "")
+	if !ok || r.Method == http.MethodHead || spec.length <= 0 {
+		return
+	}
+	if _, err := f.Seek(spec.start, io.SeekStart); err != nil {
+		return
+	}
+	_, _ = io.CopyN(w, f, spec.length)
+}
+
+type limitedStreamWriter struct {
+	w io.Writer
+	n int64
+}
+
+func (w *limitedStreamWriter) Write(p []byte) (int, error) {
+	if w.n <= 0 {
+		return 0, io.EOF
+	}
+	if int64(len(p)) > w.n {
+		p = p[:w.n]
+	}
+	n, err := w.w.Write(p)
+	w.n -= int64(n)
+	if err != nil {
+		return n, err
+	}
+	if w.n <= 0 {
+		return n, io.EOF
+	}
+	return n, nil
 }

@@ -10,7 +10,7 @@ import (
 	"github.com/iyear/tdl/core/logctx"
 )
 
-const metaCacheVersion = 4
+const metaCacheVersion = 5
 
 type metaCacheFile struct {
 	Version       int             `json:"version"`
@@ -21,21 +21,22 @@ type metaCacheFile struct {
 }
 
 type metaCacheItem struct {
-	ID           string `json:"id"`
-	PeerID       int64  `json:"peer_id"`
-	MessageID    int    `json:"message_id"`
-	LogicalPos   int    `json:"logical_pos"`
-	RelPath      string `json:"rel_path"`
-	Name         string `json:"name"`
-	MIME         string `json:"mime"`
-	Type         string `json:"type"`
-	Size         int64  `json:"size"`
-	Duration     int    `json:"duration,omitempty"`
-	Date         int64  `json:"date,omitempty"`
-	Status       string `json:"status,omitempty"`
-	Error        string `json:"error,omitempty"`
-	Progress     int64  `json:"progress,omitempty"`
-	ManualPaused bool   `json:"manual_paused,omitempty"`
+	ID           string  `json:"id"`
+	PeerID       int64   `json:"peer_id"`
+	MessageID    int     `json:"message_id"`
+	LogicalPos   int     `json:"logical_pos"`
+	RelPath      string  `json:"rel_path"`
+	Name         string  `json:"name"`
+	MIME         string  `json:"mime"`
+	Type         string  `json:"type"`
+	Size         int64   `json:"size"`
+	Duration     int     `json:"duration,omitempty"`
+	CoverAspect  float64 `json:"cover_aspect,omitempty"`
+	Date         int64   `json:"date,omitempty"`
+	Status       string  `json:"status,omitempty"`
+	Error        string  `json:"error,omitempty"`
+	Progress     int64   `json:"progress,omitempty"`
+	ManualPaused bool    `json:"manual_paused,omitempty"`
 	// Do not cache Telegram InputFileLocation here; its file_reference expires.
 }
 
@@ -90,6 +91,7 @@ func (s *Server) saveMetaCache() error {
 			Type:         it.Type,
 			Size:         it.Size,
 			Duration:     it.Duration,
+			CoverAspect:  it.CoverAspect,
 			Date:         it.Date,
 			Status:       it.Status,
 			Error:        it.Error,
@@ -170,6 +172,7 @@ func (s *Server) loadMetaCache(fingerprint string, expectedTotal int) ([]*Item, 
 			Type:         c.Type,
 			Size:         c.Size,
 			Duration:     c.Duration,
+			CoverAspect:  c.CoverAspect,
 			Date:         c.Date,
 			Status:       statusQueued,
 			Error:        c.Error,

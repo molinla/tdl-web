@@ -2,7 +2,10 @@ package web
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 
@@ -472,6 +475,136 @@ func TestAlignDown(t *testing.T) {
 	for _, c := range cases {
 		if got := alignDown(c.n, c.align); got != c.want {
 			t.Fatalf("alignDown(%d,%d)=%d want %d", c.n, c.align, got, c.want)
+		}
+	}
+}
+
+func TestPromoteTmpCompleteRenames(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(target+tempExt, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	promoted, err := promoteTmp(target, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !promoted {
+		t.Fatal("complete tmp was not promoted")
+	}
+	if !sameFileExists(target, 6) {
+		t.Fatal("target file missing after promotion")
+	}
+	if _, err := os.Stat(target + tempExt); !os.IsNotExist(err) {
+		t.Fatalf("tmp still exists after promotion: %v", err)
+	}
+}
+
+func TestPromoteTmpBusyDefersWithoutError(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(target+tempExt, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prevRename := renameFile
+	prevDelay := promoteTmpRetryDelay
+	renameFile = func(oldpath, newpath string) error {
+		return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.Errno(32)}
+	}
+	promoteTmpRetryDelay = time.Millisecond
+	defer func() {
+		renameFile = prevRename
+		promoteTmpRetryDelay = prevDelay
+	}()
+
+	promoted, err := promoteTmp(target, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if promoted {
+		t.Fatal("busy tmp should defer promotion")
+	}
+	if _, err := os.Stat(target + tempExt); err != nil {
+		t.Fatalf("tmp should remain available: %v", err)
+	}
+	if _, err := os.Stat(target); !os.IsNotExist(err) {
+		t.Fatalf("target should not exist while rename is busy: %v", err)
+	}
+}
+
+func TestPromoteTmpRetriesBusyRename(t *testing.T) {
+	target := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(target+tempExt, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	prevRename := renameFile
+	prevDelay := promoteTmpRetryDelay
+	attempts := 0
+	renameFile = func(oldpath, newpath string) error {
+		attempts++
+		if attempts == 1 {
+			return &os.LinkError{Op: "rename", Old: oldpath, New: newpath, Err: syscall.Errno(32)}
+		}
+		return os.Rename(oldpath, newpath)
+	}
+	promoteTmpRetryDelay = time.Millisecond
+	defer func() {
+		renameFile = prevRename
+		promoteTmpRetryDelay = prevDelay
+	}()
+
+	promoted, err := promoteTmp(target, 6)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !promoted || attempts != 2 || !sameFileExists(target, 6) {
+		t.Fatalf("promoted=%v attempts=%d target=%v", promoted, attempts, sameFileExists(target, 6))
+	}
+}
+
+func TestDeferredTmpPromotionDoesNotMarkError(t *testing.T) {
+	prevHook := testDownloadHook
+	testDownloadHook = func(context.Context, string) error {
+		return errTmpPromotionDeferred
+	}
+	defer func() { testDownloadHook = prevHook }()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	target := filepath.Join(t.TempDir(), "video.mp4")
+	if err := os.WriteFile(target+tempExt, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := &Server{
+		ctx:         ctx,
+		items:       map[string]*Item{},
+		finished:    map[int]struct{}{},
+		downloading: map[string]struct{}{},
+		cancels:     map[string]context.CancelFunc{},
+		events:      make(chan struct{}, 1),
+	}
+	s.items["v"] = &Item{ID: "v", Type: mediaVideo, Status: statusQueued, TargetPath: target, Size: 6}
+
+	s.enqueueDownload("v")
+	deadline := time.After(2 * time.Second)
+	for {
+		s.mu.RLock()
+		status := s.items["v"].Status
+		errText := s.items["v"].Error
+		s.mu.RUnlock()
+		if s.activeDownloadCount() == 0 && s.pendingDownloadCount() == 0 && status != statusCaching {
+			if status != statusPaused || errText != "" {
+				t.Fatalf("status=%q error=%q, want paused without error", status, errText)
+			}
+			return
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("timed out; active=%d pending=%d status=%s", s.activeDownloadCount(), s.pendingDownloadCount(), status)
+		default:
+			time.Sleep(20 * time.Millisecond)
 		}
 	}
 }

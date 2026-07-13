@@ -1,7 +1,9 @@
 package web
 
 import (
+	"errors"
 	"os"
+	"path/filepath"
 )
 
 const (
@@ -31,4 +33,30 @@ func validThumbCacheFile(path string) bool {
 		return false
 	}
 	return true
+}
+
+// writeInlineThumb persists embedded JPEG bytes (e.g. PhotoStrippedSize) to cache.
+func writeInlineThumb(data []byte, path string) error {
+	if len(data) < 3 || data[0] != 0xff || data[1] != 0xd8 || data[2] != 0xff {
+		return errors.New("inline thumb is not JPEG")
+	}
+	if validThumbCacheFile(path) {
+		return nil
+	}
+	if err := os.MkdirAll(filepath.Dir(path), defaultCachePerm); err != nil {
+		return err
+	}
+	tmp := path + tempExt
+	_ = os.Remove(tmp)
+	if err := os.WriteFile(tmp, data, 0o644); err != nil {
+		return err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	if !validThumbCacheFile(path) {
+		_ = os.Remove(path)
+		return errors.New("inline thumb cache invalid")
+	}
+	return nil
 }

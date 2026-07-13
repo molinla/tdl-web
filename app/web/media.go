@@ -21,8 +21,6 @@ import (
 	"github.com/iyear/tdl/pkg/utils"
 )
 
-var placeholderSVG = `<svg xmlns="http://www.w3.org/2000/svg" width="320" height="180"><rect width="100%" height="100%" fill="#141414"/><text x="50%" y="50%" fill="#808080" text-anchor="middle" dominant-baseline="middle" font-family="sans-serif" font-size="18">no thumbnail</text></svg>`
-
 func convertMedia(msg *tg.Message) (*media, *media, string, int, error) {
 	md, ok := tmedia.GetMedia(msg)
 	if !ok {
@@ -39,29 +37,57 @@ func convertMedia(msg *tg.Message) (*media, *media, string, int, error) {
 		}
 		mime = doc.MimeType
 		duration = videoDuration(doc)
-		if th, ok := tmedia.GetDocumentThumb(doc); ok {
+		if th, ok := tmedia.GetDocumentCover(m); ok {
 			thumb = &media{
 				Location: th.InputFileLoc,
 				Name:     th.Name,
 				Size:     th.Size,
 				DC:       th.DC,
 				MIME:     "image/jpeg",
+				Width:    th.Width,
+				Height:   th.Height,
+				Inline:   th.Inline,
 			}
 		}
 	case *tg.MessageMediaPhoto:
 		mime = "image/jpeg"
 	}
 	main := &media{
-		Location: md.InputFileLoc,
-		Name:     md.Name,
-		Size:     md.Size,
-		DC:       md.DC,
-		MIME:     mime,
+		Location:          md.InputFileLoc,
+		Name:              md.Name,
+		Size:              md.Size,
+		DC:                md.DC,
+		MIME:              mime,
+		Width:             md.Width,
+		Height:            md.Height,
+		SupportsStreaming: md.SupportsStreaming,
+		PreloadPrefixSize: md.PreloadPrefixSize,
 	}
 	if thumb == nil && strings.HasPrefix(mime, "image/") {
 		thumb = main
 	}
 	return main, thumb, mime, duration, nil
+}
+
+func mediaAspect(m *media) float64 {
+	if m == nil || m.Width <= 0 || m.Height <= 0 {
+		return 0
+	}
+	return aspectFromSize(m.Width, m.Height)
+}
+
+func coverAspect(main, thumb *media) float64 {
+	if aspect := mediaAspect(thumb); aspect > 0 {
+		return aspect
+	}
+	return mediaAspect(main)
+}
+
+func aspectFromSize(width, height int) float64 {
+	if width <= 0 || height <= 0 {
+		return 0
+	}
+	return float64(height) / float64(width)
 }
 
 func videoDuration(doc *tg.Document) int {

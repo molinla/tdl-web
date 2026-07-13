@@ -8,8 +8,15 @@ type Media struct {
 	InputFileLoc tg.InputFileLocationClass // mtproto file location of the media file
 	Name         string                    // file name
 	Size         int64                     // size in bytes
-	DC           int                       // which DC the media is stored
-	Date         int64                     // media creation(upload) timestamp
+	Width        int
+	Height       int
+	DC           int   // which DC the media is stored
+	Date         int64 // media creation(upload) timestamp
+	// Inline contains already-expanded JPEG bytes for Telegram stripped thumbs.
+	Inline []byte
+	// Video streaming hints from DocumentAttributeVideo.
+	SupportsStreaming bool
+	PreloadPrefixSize int
 }
 
 func ExtractMedia(m tg.MessageMediaClass) (*Media, bool) {
@@ -64,7 +71,7 @@ func MediaUnavailableReason(msg *tg.Message) string {
 		if !ok {
 			return "photo unavailable on Telegram (deleted or expired)"
 		}
-		if _, _, ok := GetPhotoSize(p.Sizes); !ok {
+		if _, _, _, _, ok := GetPhotoSize(p.Sizes); !ok {
 			return "photo has no downloadable size"
 		}
 		return "photo media could not be parsed"
@@ -93,15 +100,8 @@ func GetDocumentThumb(doc *tg.Document) (*Media, bool) {
 		return nil, false
 	}
 
-	photoSize := &tg.PhotoSize{}
-	for _, t := range thumbs {
-		if p, ok := t.(*tg.PhotoSize); ok {
-			photoSize = p
-			break
-		}
-	}
-
-	if photoSize == nil {
+	tp, size, width, height, ok := GetPhotoSize(thumbs)
+	if !ok {
 		return nil, false
 	}
 
@@ -110,11 +110,108 @@ func GetDocumentThumb(doc *tg.Document) (*Media, bool) {
 			ID:            doc.ID,
 			AccessHash:    doc.AccessHash,
 			FileReference: doc.FileReference,
-			ThumbSize:     photoSize.Type,
+			ThumbSize:     tp,
 		},
-		Name: "thumb.jpg",
-		Size: int64(photoSize.Size),
-		DC:   doc.DCID,
-		Date: int64(doc.Date),
+		Name:   "thumb.jpg",
+		Size:   int64(size),
+		Width:  width,
+		Height: height,
+		DC:     doc.DCID,
+		Date:   int64(doc.Date),
 	}, true
+}
+
+func GetDocumentCover(media *tg.MessageMediaDocument) (*Media, bool) {
+	doc, ok := media.Document.(*tg.Document)
+	if !ok {
+		return nil, false
+	}
+	if cover, ok := media.GetVideoCover(); ok {
+		if photo, ok := cover.(*tg.Photo); ok {
+			if result, ok := GetPhotoMedia(photo); ok {
+				return result, true
+			}
+		}
+	}
+	if thumb, ok := GetDocumentVideoThumb(doc); ok {
+		return thumb, true
+	}
+	if thumb, ok := GetDocumentThumb(doc); ok {
+		return thumb, true
+	}
+	if inline, ok := GetDocumentStrippedThumb(doc); ok {
+		return &Media{
+			Name:   "thumb.jpg",
+			Size:   int64(len(inline)),
+			Inline: inline,
+		}, true
+	}
+	return nil, false
+}
+
+func GetDocumentVideoThumb(doc *tg.Document) (*Media, bool) {
+	thumbs, exists := doc.GetVideoThumbs()
+	if !exists {
+		return nil, false
+	}
+	tp, size, width, height, ok := GetVideoSize(thumbs)
+	if !ok {
+		return nil, false
+	}
+	return &Media{
+		InputFileLoc: &tg.InputDocumentFileLocation{
+			ID:            doc.ID,
+			AccessHash:    doc.AccessHash,
+			FileReference: doc.FileReference,
+			ThumbSize:     tp,
+		},
+		Name:   "thumb.jpg",
+		Size:   int64(size),
+		Width:  width,
+		Height: height,
+		DC:     doc.DCID,
+		Date:   int64(doc.Date),
+	}, true
+}
+
+func GetVideoSize(sizes []tg.VideoSizeClass) (string, int, int, int, bool) {
+	var (
+		bestType string
+		bestSize int
+		bestW    int
+		bestH    int
+		found    bool
+	)
+	for _, size := range sizes {
+		switch s := size.(type) {
+		case *tg.VideoSize:
+			score := s.Size
+			if score == 0 {
+				score = s.W * s.H
+			}
+			if !found || score >= bestSize {
+				bestType, bestSize, bestW, bestH, found = s.Type, score, s.W, s.H, true
+			}
+		}
+	}
+	return bestType, bestSize, bestW, bestH, found
+}
+
+// GetDocumentStrippedThumb returns the expanded inline JPEG blur preview
+// embedded in a document when no downloadable thumb is available.
+func GetDocumentStrippedThumb(doc *tg.Document) ([]byte, bool) {
+	thumbs, exists := doc.GetThumbs()
+	if !exists {
+		return nil, false
+	}
+	for _, size := range thumbs {
+		s, ok := size.(*tg.PhotoStrippedSize)
+		if !ok {
+			continue
+		}
+		if jpg, ok := StrippedPhotoToJPG(s.Bytes); ok {
+			return jpg, true
+		}
+	}
+	return nil, false
 }

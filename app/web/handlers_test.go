@@ -185,6 +185,121 @@ func TestHandleStreamUsesTmpRange(t *testing.T) {
 	}
 }
 
+func TestHandleStreamUsesNoStoreForLocalVideo(t *testing.T) {
+	s := newHandlerTestServer(t)
+	id := "local-video"
+	target := filepath.Join(s.opts.Dir, "video.mp4")
+	if err := os.MkdirAll(filepath.Dir(target), defaultCachePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.items[id] = &Item{
+		ID:         id,
+		Type:       mediaVideo,
+		Status:     statusCompleted,
+		TargetPath: target,
+		MIME:       "video/mp4",
+		Size:       6,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/items/"+id+"/stream", nil)
+	req.Header.Set("Range", "bytes=1-3")
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rr := httptest.NewRecorder()
+	s.handleStream(context.Background()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Body.String(); got != "bcd" {
+		t.Fatalf("body=%q, want %q", got, "bcd")
+	}
+	if got := rr.Header().Get("Content-Range"); got != "bytes 1-3/6" {
+		t.Fatalf("Content-Range=%q", got)
+	}
+	if got := rr.Header().Get("Cache-Control"); got != "no-store" {
+		t.Fatalf("Cache-Control=%q, want no-store", got)
+	}
+}
+
+func TestBoundedStreamRangeCapsLargeResponses(t *testing.T) {
+	spec, _, err := boundedStreamRange("", streamChunkMaxBytes+99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.start != 0 || spec.length != streamChunkMaxBytes || !spec.partial {
+		t.Fatalf("spec=%+v, want first capped partial chunk", spec)
+	}
+
+	spec, _, err = boundedStreamRange("bytes=5-", streamChunkMaxBytes+99)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if spec.start != 5 || spec.length != streamChunkMaxBytes || !spec.partial {
+		t.Fatalf("spec=%+v, want capped range from 5", spec)
+	}
+}
+
+func TestHandleStreamPromotesCompleteTmpAfterRange(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newHandlerTestServer(t)
+	s.ctx = ctx
+
+	id := "complete-video"
+	target := filepath.Join(s.opts.Dir, "video.mp4")
+	if err := os.MkdirAll(filepath.Dir(target), defaultCachePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target+tempExt, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.items[id] = &Item{
+		ID:         id,
+		Type:       mediaVideo,
+		Status:     statusPaused,
+		TargetPath: target,
+		MIME:       "video/mp4",
+		Size:       6,
+		LogicalPos: 7,
+	}
+
+	req := httptest.NewRequest(http.MethodGet, "/api/items/"+id+"/stream", nil)
+	req.Header.Set("Range", "bytes=1-3")
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rr := httptest.NewRecorder()
+	s.handleStream(ctx).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	if got := rr.Body.String(); got != "bcd" {
+		t.Fatalf("body=%q, want %q", got, "bcd")
+	}
+
+	deadline := time.After(2 * time.Second)
+	for {
+		s.mu.RLock()
+		status := s.items[id].Status
+		_, done := s.finished[7]
+		s.mu.RUnlock()
+		if sameFileExists(target, 6) && status == statusCompleted && done {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatal("complete tmp was not promoted")
+		default:
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+	if got := s.pendingDownloadCount(); got != 0 {
+		t.Fatalf("pending downloads=%d, want 0", got)
+	}
+}
+
 func TestEnsureThumbCacheCoalescesConcurrentBuilds(t *testing.T) {
 	s := newHandlerTestServer(t)
 	path := s.thumbCachePath("coalesce")

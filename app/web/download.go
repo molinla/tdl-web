@@ -5,6 +5,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/go-faster/errors"
@@ -14,6 +15,14 @@ import (
 
 	"github.com/iyear/tdl/pkg/consts"
 )
+
+var (
+	renameFile              = os.Rename
+	errTmpPromotionDeferred = errors.New("tmp promotion deferred")
+	promoteTmpRetryDelay    = 100 * time.Millisecond
+)
+
+const promoteTmpAttempts = 5
 
 func downloadLimit() int {
 	limit := viper.GetInt(consts.FlagLimit)
@@ -151,7 +160,13 @@ func (s *Server) preemptBackgroundDownload() {
 	if !canPreempt {
 		return
 	}
+	s.cancelOneBackgroundDownload()
+}
 
+// cancelOneBackgroundDownload marks one non-priority download as preempted and
+// cancels it. The download is re-queued when its goroutine exits.
+// Returns true if a download was canceled.
+func (s *Server) cancelOneBackgroundDownload() bool {
 	var cancel context.CancelFunc
 	s.mu.Lock()
 	for id := range s.downloading {
@@ -168,9 +183,61 @@ func (s *Server) preemptBackgroundDownload() {
 		}
 	}
 	s.mu.Unlock()
-	if cancel != nil {
-		cancel()
+	if cancel == nil {
+		return false
 	}
+	cancel()
+	return true
+}
+
+func (s *Server) downloadLimitWithCoverHoldLocked() int {
+	limit := downloadLimit() - s.coverBandwidthHold
+	if limit < 0 {
+		return 0
+	}
+	return limit
+}
+
+// beginCoverBandwidth reserves download capacity for cover Telegram work and
+// preempts all background downloads. Priority (play) downloads are kept.
+// A single remaining multi-threaded download is enough to starve covers, so
+// freeing only one slot is not sufficient.
+func (s *Server) beginCoverBandwidth(ctx context.Context) {
+	s.ensureDownloadScheduler()
+	s.dlMu.Lock()
+	reserve := downloadLimit() - s.dlActivePri
+	if reserve < 1 {
+		reserve = 1
+	}
+	s.coverBandwidthHold += reserve
+	s.dlMu.Unlock()
+
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		for s.cancelOneBackgroundDownload() {
+		}
+		s.dlMu.Lock()
+		bgActive := s.dlActive - s.dlActivePri
+		cap := s.downloadLimitWithCoverHoldLocked()
+		ok := bgActive <= 0 && s.dlActive <= cap
+		s.dlMu.Unlock()
+		if ok {
+			return
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
+func (s *Server) endCoverBandwidth() {
+	s.dlMu.Lock()
+	// coverLimit is 1; clear the reservation for this cover job.
+	s.coverBandwidthHold = 0
+	s.dlMu.Unlock()
+	s.wakeDownloader()
 }
 
 func (s *Server) removeFromQueue(id string) {
@@ -242,7 +309,7 @@ func (s *Server) popBackgroundLocked() (string, bool) {
 // tryStartDownloadLocked picks the next job that fits reserved/shared slot rules.
 // Caller must hold dlMu. On success, dlActive(/Pri) are incremented.
 func (s *Server) tryStartDownloadLocked() (id string, priority bool, ok bool) {
-	limit := downloadLimit()
+	limit := s.downloadLimitWithCoverHoldLocked()
 	reserved := downloadReservedSlots(limit)
 	sharedCap := limit - reserved
 	if s.dlActive >= limit {
@@ -261,9 +328,10 @@ func (s *Server) tryStartDownloadLocked() (id string, priority bool, ok bool) {
 		hasPriWaiting = len(s.dlPriQueue) > 0
 	}
 
-	// Background: shared slots only; borrow reserved when nothing priority is waiting.
+	// Background: shared slots only; borrow reserved when no priority work is
+	// waiting or running.
 	bgCap := sharedCap
-	if !hasPriWaiting {
+	if !hasPriWaiting && s.dlActivePri == 0 {
 		bgCap = limit
 	}
 	bgActive := s.dlActive - s.dlActivePri
@@ -363,6 +431,12 @@ func (s *Server) startDownload(parent context.Context, id string, priority bool)
 			switch {
 			case err == nil:
 				// markCompleted already set status
+			case errors.Is(err, errTmpPromotionDeferred):
+				it.Status = statusPaused
+				it.Error = ""
+				if p := tmpProgress(it.TargetPath, it.Size); p > it.Progress {
+					it.Progress = p
+				}
 			case errors.Is(err, context.Canceled) && wasPreempted:
 				it.Status = statusQueued
 				it.Error = ""
@@ -492,8 +566,13 @@ func (s *Server) downloadItem(ctx context.Context, id string) error {
 	}
 	if size > 0 && startOffset >= size {
 		_ = f.Close()
-		if err := os.Rename(tmp, target); err != nil {
+		promoted, err := promoteTmp(target, size)
+		if err != nil {
 			return err
+		}
+		if !promoted {
+			s.setProgress(id, tmpProgress(target, size))
+			return errTmpPromotionDeferred
 		}
 		s.markCompleted(ctx, id, logical, size)
 		return nil
@@ -546,8 +625,13 @@ func (s *Server) downloadItem(ctx context.Context, id string) error {
 	if streamErr != nil && !errors.Is(streamErr, io.EOF) {
 		return streamErr
 	}
-	if err := os.Rename(tmp, target); err != nil {
+	promoted, err := promoteTmp(target, size)
+	if err != nil {
 		return err
+	}
+	if !promoted {
+		s.setProgress(id, tmpProgress(target, size))
+		return errTmpPromotionDeferred
 	}
 	s.markCompleted(ctx, id, logical, size)
 	return nil
@@ -629,6 +713,74 @@ func tmpProgress(target string, size int64) int64 {
 		return 0
 	}
 	return n
+}
+
+func tmpComplete(target string, size int64) bool {
+	if size <= 0 {
+		return false
+	}
+	st, err := os.Stat(target + tempExt)
+	return err == nil && st.Size() >= size
+}
+
+func promoteTmp(target string, size int64) (bool, error) {
+	if promotedFileExists(target, size) {
+		return true, nil
+	}
+	tmp := target + tempExt
+	if size > 0 {
+		if !tmpComplete(target, size) {
+			return false, nil
+		}
+	} else if _, err := os.Stat(tmp); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	var lastErr error
+	for i := 0; i < promoteTmpAttempts; i++ {
+		if err := renameFile(tmp, target); err != nil {
+			if promotedFileExists(target, size) {
+				return true, nil
+			}
+			if !isTmpBusyRename(err) {
+				return false, err
+			}
+			lastErr = err
+			time.Sleep(promoteTmpRetryDelay)
+			continue
+		}
+		return true, nil
+	}
+	if size <= 0 {
+		if _, err := os.Stat(tmp); err == nil || os.IsNotExist(err) {
+			return false, nil
+		} else {
+			return false, err
+		}
+	}
+	if tmpComplete(target, size) {
+		return false, nil
+	}
+	return false, lastErr
+}
+
+func promotedFileExists(target string, size int64) bool {
+	if size > 0 {
+		return sameFileExists(target, size)
+	}
+	_, err := os.Stat(target)
+	return err == nil
+}
+
+func isTmpBusyRename(err error) bool {
+	linkErr, ok := err.(*os.LinkError)
+	if !ok {
+		return false
+	}
+	errno, ok := linkErr.Err.(syscall.Errno)
+	return ok && (errno == 32 || errno == 33)
 }
 
 // applyDiskProgress sets paused/completed from local files after import.

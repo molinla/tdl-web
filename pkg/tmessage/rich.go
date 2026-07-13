@@ -28,6 +28,8 @@ type MediaInfo struct {
 	Size     int64
 	MIME     string
 	Duration int
+	Width    int
+	Height   int
 	Kind     string // video | image | file
 	Caption  string
 }
@@ -49,6 +51,8 @@ type richMessage struct {
 	MediaType       string      `mapstructure:"media_type"`
 	MimeType        string      `mapstructure:"mime_type"`
 	DurationSeconds int         `mapstructure:"duration_seconds"`
+	Width           int         `mapstructure:"width"`
+	Height          int         `mapstructure:"height"`
 	Text            interface{} `mapstructure:"text"`
 }
 
@@ -121,6 +125,8 @@ func collectRich(ctx context.Context, r io.Reader, peer peers.Peer, onlyMedia bo
 			Size:     fm.FileSize,
 			MIME:     fm.MimeType,
 			Duration: fm.DurationSeconds,
+			Width:    fm.Width,
+			Height:   fm.Height,
 			Caption:  textAsString(fm.Text),
 		}
 		if fm.Time != "" {

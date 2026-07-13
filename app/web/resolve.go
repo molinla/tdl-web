@@ -66,6 +66,9 @@ func (s *Server) ensureMedia(ctx context.Context, id string) (*Item, error) {
 	if item.Size == 0 && main != nil {
 		item.Size = main.Size
 	}
+	if aspect := coverAspect(main, thumb); aspect > 0 {
+		item.CoverAspect = aspect
+	}
 	out := item
 	s.mu.Unlock()
 

@@ -11,8 +11,11 @@ func GetPhotoInfo(photo *tg.MessageMediaPhoto) (*Media, bool) {
 	if !ok {
 		return nil, false
 	}
+	return GetPhotoMedia(p)
+}
 
-	tp, size, ok := GetPhotoSize(p.Sizes)
+func GetPhotoMedia(p *tg.Photo) (*Media, bool) {
+	tp, size, width, height, ok := GetPhotoSize(p.Sizes)
 	if !ok {
 		return nil, false
 	}
@@ -24,26 +27,30 @@ func GetPhotoInfo(photo *tg.MessageMediaPhoto) (*Media, bool) {
 			ThumbSize:     tp,
 		},
 		// Telegram photo is compressed, and extension is always jpg.
-		Name: strconv.FormatInt(p.ID, 10) + ".jpg", // unique name
-		Size: int64(size),
-		DC:   p.DCID,
-		Date: int64(p.Date),
+		Name:   strconv.FormatInt(p.ID, 10) + ".jpg", // unique name
+		Size:   int64(size),
+		Width:  width,
+		Height: height,
+		DC:     p.DCID,
+		Date:   int64(p.Date),
 	}, true
 }
 
 // GetPhotoSize picks the largest downloadable photo size.
 // Prefer real PhotoSize / Progressive over in-memory CachedSize.
-func GetPhotoSize(sizes []tg.PhotoSizeClass) (string, int, bool) {
+func GetPhotoSize(sizes []tg.PhotoSizeClass) (string, int, int, int, bool) {
 	var (
 		bestType string
 		bestSize int
+		bestW    int
+		bestH    int
 		found    bool
 	)
 	for _, size := range sizes {
 		switch s := size.(type) {
 		case *tg.PhotoSize:
 			if !found || s.Size >= bestSize {
-				bestType, bestSize, found = s.Type, s.Size, true
+				bestType, bestSize, bestW, bestH, found = s.Type, s.Size, s.W, s.H, true
 			}
 		case *tg.PhotoSizeProgressive:
 			sz := 0
@@ -51,15 +58,15 @@ func GetPhotoSize(sizes []tg.PhotoSizeClass) (string, int, bool) {
 				sz = s.Sizes[n-1]
 			}
 			if !found || sz >= bestSize {
-				bestType, bestSize, found = s.Type, sz, true
+				bestType, bestSize, bestW, bestH, found = s.Type, sz, s.W, s.H, true
 			}
 		case *tg.PhotoCachedSize:
 			sz := len(s.Bytes)
 			// Only use cached bytes when no remote size exists yet.
 			if !found {
-				bestType, bestSize, found = s.Type, sz, true
+				bestType, bestSize, bestW, bestH, found = s.Type, sz, s.W, s.H, true
 			}
 		}
 	}
-	return bestType, bestSize, found
+	return bestType, bestSize, bestW, bestH, found
 }

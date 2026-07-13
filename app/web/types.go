@@ -55,29 +55,30 @@ type Options struct {
 }
 
 type Item struct {
-	ID              string `json:"id"`
-	PeerID          int64  `json:"peer_id"`
-	MessageID       int    `json:"message_id"`
-	LogicalPos      int    `json:"logical_pos"`
-	Name            string `json:"name"`
-	MIME            string `json:"mime"`
-	Type            string `json:"type"`
-	Size            int64  `json:"size"`
-	Duration        int    `json:"duration,omitempty"`
-	Date            int64  `json:"date,omitempty"` // message unix seconds
-	Status          string `json:"status"`
-	Progress        int64  `json:"progress"`
-	Error           string `json:"error,omitempty"`
-	TargetPath      string `json:"target_path"`
-	ThumbURL        string `json:"thumb_url,omitempty"`
-	CoverURL        string `json:"cover,omitempty"`
-	PreviewURL      string `json:"preview_url,omitempty"`
-	StreamURL       string `json:"stream_url,omitempty"`
-	DownloadURL     string `json:"download_url"`
-	ResumeCompleted bool   `json:"resume_completed"`
-	SkipSame        bool   `json:"skip_same"`
-	QueuePos        int    `json:"queue_pos,omitempty"` // 1-based wait queue; 0 if not waiting
-	ManualPaused    bool   `json:"manual_paused,omitempty"`
+	ID              string  `json:"id"`
+	PeerID          int64   `json:"peer_id"`
+	MessageID       int     `json:"message_id"`
+	LogicalPos      int     `json:"logical_pos"`
+	Name            string  `json:"name"`
+	MIME            string  `json:"mime"`
+	Type            string  `json:"type"`
+	Size            int64   `json:"size"`
+	Duration        int     `json:"duration,omitempty"`
+	Date            int64   `json:"date,omitempty"` // message unix seconds
+	Status          string  `json:"status"`
+	Progress        int64   `json:"progress"`
+	Error           string  `json:"error,omitempty"`
+	TargetPath      string  `json:"target_path"`
+	ThumbURL        string  `json:"thumb_url,omitempty"`
+	CoverURL        string  `json:"cover,omitempty"`
+	CoverAspect     float64 `json:"cover_aspect,omitempty"` // height / width
+	PreviewURL      string  `json:"preview_url,omitempty"`
+	StreamURL       string  `json:"stream_url,omitempty"`
+	DownloadURL     string  `json:"download_url"`
+	ResumeCompleted bool    `json:"resume_completed"`
+	SkipSame        bool    `json:"skip_same"`
+	QueuePos        int     `json:"queue_pos,omitempty"` // 1-based wait queue; 0 if not waiting
+	ManualPaused    bool    `json:"manual_paused,omitempty"`
 
 	media *media
 	thumb *media
@@ -89,6 +90,12 @@ type media struct {
 	Size     int64
 	DC       int
 	MIME     string
+	Width    int
+	Height   int
+	// Inline JPEG thumb bytes (PhotoStrippedSize); no Telegram download needed.
+	Inline            []byte
+	SupportsStreaming bool
+	PreloadPrefixSize int
 }
 
 type Server struct {
@@ -124,11 +131,24 @@ type Server struct {
 	dlActive    int
 	dlActivePri int
 	dlWake      chan struct{}
+	// coverBandwidthHold temporarily reduces download concurrency so cover
+	// Telegram transfers are not starved by background downloads.
+	coverBandwidthHold int
 
-	// Telegram media serve gate (thumb/preview fail-fast; stream reserved).
+	// Telegram media serve gate (preview fail-fast; stream reserved).
 	tgServeOnce sync.Once
 	tgShared    chan struct{}
 	tgStream    chan struct{}
+
+	// Cover build scheduler (isolated tgCover slots; does not share tgShared).
+	coverOnce     sync.Once
+	coverMu       sync.Mutex
+	coverPriQueue []string
+	coverQueue    []string
+	coverPending  map[string]struct{}
+	coverActive   map[string]struct{}
+	coverWake     chan struct{}
+	tgCover       chan struct{}
 
 	// Coalesces same-item thumbnail/poster cache builds.
 	thumbGroup singleflight.Group
