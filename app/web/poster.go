@@ -32,6 +32,10 @@ const (
 
 // extractVideoPoster writes the first frame of a local video to outJpg using ffmpeg.
 func extractVideoPoster(videoPath, outJpg string) error {
+	return extractVideoPosterContext(context.Background(), videoPath, outJpg)
+}
+
+func extractVideoPosterContext(parent context.Context, videoPath, outJpg string) error {
 	if st, err := os.Stat(videoPath); err != nil || st.Size() == 0 {
 		return fmt.Errorf("video missing")
 	}
@@ -51,7 +55,7 @@ func extractVideoPoster(videoPath, outJpg string) error {
 	tmp := outJpg + ".part.jpg"
 	_ = os.Remove(tmp)
 
-	ctx, cancel := context.WithTimeout(context.Background(), 45*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 45*time.Second)
 	defer cancel()
 
 	// Tolerate truncated / still-downloading files (moov may be incomplete).
@@ -68,6 +72,9 @@ func extractVideoPoster(videoPath, outJpg string) error {
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		_ = os.Remove(tmp)
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
 		return fmt.Errorf("ffmpeg: %w (%s)", err, string(out))
 	}
 	if st, err := os.Stat(tmp); err != nil || st.Size() == 0 {
@@ -107,12 +114,16 @@ func (s *Server) extractRemoteVideoPoster(ctx context.Context, m *media, outJpg 
 		case remotePosterModePrefix:
 			if err := s.extractRemoteVideoPosterBytes(ctx, m, outJpg, attempt.bytes, timeout); err == nil {
 				return nil
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
 			} else {
 				attempts = append(attempts, attempt.String()+": "+err.Error())
 			}
 		case remotePosterModeSparse:
 			if err := s.extractRemoteSparseVideoPosterPass(ctx, m, outJpg, attempt.bytes, timeout); err == nil {
 				return nil
+			} else if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return err
 			} else {
 				attempts = append(attempts, attempt.String()+": "+err.Error())
 			}
@@ -225,7 +236,7 @@ func (s *Server) extractRemoteVideoPosterBytes(ctx context.Context, m *media, ou
 	if err := s.downloadMediaPrefix(dlCtx, m, prefixPath, need); err != nil {
 		return err
 	}
-	return extractVideoPoster(prefixPath, outJpg)
+	return extractVideoPosterContext(ctx, prefixPath, outJpg)
 }
 
 func remotePosterTempExt(m *media) string {
@@ -308,7 +319,7 @@ func (s *Server) extractRemoteSparseVideoPosterPass(ctx context.Context, m *medi
 	if err := s.downloadMediaRange(dlCtx, m, sparsePath, tailOffset, tailLen); err != nil {
 		return errors.Wrap(err, "download tail")
 	}
-	return extractVideoPoster(sparsePath, outJpg)
+	return extractVideoPosterContext(ctx, sparsePath, outJpg)
 }
 
 func sparsePosterRanges(size, span int64) (headLen, tailOffset, tailLen int64) {

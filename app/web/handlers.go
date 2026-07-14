@@ -212,6 +212,20 @@ func (s *Server) handlePause(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, map[string]any{"ok": true})
 }
 
+func (s *Server) handleCoverState(w http.ResponseWriter, r *http.Request) {
+	var req struct {
+		Paused          bool     `json:"paused"`
+		VisibleVideoIDs []string `json:"visible_video_ids"`
+	}
+	r.Body = http.MaxBytesReader(w, r.Body, 64*1024)
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid request", http.StatusBadRequest)
+		return
+	}
+	s.setCoverState(req.Paused, req.VisibleVideoIDs)
+	writeJSON(w, map[string]any{"ok": true})
+}
+
 func (s *Server) handleThumb(ctx context.Context) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		id := mux.Vars(r)["id"]
@@ -252,43 +266,40 @@ func (s *Server) handleThumb(ctx context.Context) http.HandlerFunc {
 		}
 
 		// 3) Local video (complete or in-progress .tmp) -> first-frame JPEG.
-		if itemType == mediaVideo {
-			hasLocalVideo := false
-			for _, path := range []string{target, target + tempExt} {
-				if st, err := os.Stat(path); err == nil && st.Size() >= posterMinLocalBytes {
-					hasLocalVideo = true
-					break
-				}
-			}
-			if hasLocalVideo {
-				_ = s.ensureThumbCache("thumb:"+id, thumbPath, func() error {
-					var lastErr error
-					for _, path := range []string{target, target + tempExt} {
-						if st, err := os.Stat(path); err == nil && st.Size() >= posterMinLocalBytes {
-							if err := extractVideoPoster(path, thumbPath); err == nil {
-								return nil
-							} else {
-								lastErr = err
-							}
+		if itemType == mediaVideo && hasLocalVideoCoverSource(target) {
+			_ = s.ensureThumbCache("thumb:"+id, thumbPath, func() error {
+				var lastErr error
+				for _, path := range []string{target, target + tempExt} {
+					if st, err := os.Stat(path); err == nil && st.Size() >= posterMinLocalBytes {
+						if err := extractVideoPoster(path, thumbPath); err == nil {
+							return nil
+						} else {
+							lastErr = err
 						}
 					}
-					if lastErr != nil {
-						return lastErr
-					}
-					return errors.New("local video unavailable")
-				})
-				if validThumbCacheFile(thumbPath) {
-					if f, err := os.Open(thumbPath); err == nil {
-						defer f.Close()
-						setMediaCacheHeaders(w)
-						serveLocalFile(w, r, f, id+".jpg", "image/jpeg")
-						return
-					}
+				}
+				if lastErr != nil {
+					return lastErr
+				}
+				return errors.New("local video unavailable")
+			})
+			if validThumbCacheFile(thumbPath) {
+				if f, err := os.Open(thumbPath); err == nil {
+					defer f.Close()
+					setMediaCacheHeaders(w)
+					serveLocalFile(w, r, f, id+".jpg", "image/jpeg")
+					return
 				}
 			}
 		}
 
 		// 4–5) Telegram thumb / remote poster via isolated cover queue.
+		requestedPriority := itemType == mediaVideo && r.URL.Query().Get("priority") != ""
+		coverPriority, allowed := s.coverRequestPolicy(id, itemType, requestedPriority)
+		if !allowed {
+			serveThumbUnavailable(w)
+			return
+		}
 		if itemStatus == statusError {
 			s.resetItemError(id)
 		}
@@ -305,14 +316,14 @@ func (s *Server) handleThumb(ctx context.Context) http.HandlerFunc {
 			} else if thumb.Size > thumbCacheMaxBytes && itemType != mediaImage {
 				serveThumbUnavailable(w)
 				return
-			} else if s.tryServeTelegramCover(w, r, ctx, id, itemType, resolved, retryRequest) {
+			} else if s.tryServeTelegramCover(w, r, ctx, id, itemType, resolved, coverPriority, retryRequest) {
 				return
 			} else if itemType != mediaImage {
 				serveThumbUnavailable(w)
 				return
 			}
 		} else if itemType == mediaVideo && resolved != nil && resolved.media != nil {
-			if s.tryServeTelegramCover(w, r, ctx, id, itemType, resolved, retryRequest) {
+			if s.tryServeTelegramCover(w, r, ctx, id, itemType, resolved, coverPriority, retryRequest) {
 				return
 			}
 		}
@@ -321,7 +332,7 @@ func (s *Server) handleThumb(ctx context.Context) http.HandlerFunc {
 		if itemType == mediaImage && resolved != nil && resolved.media != nil {
 			src := resolved.media
 			if src.Size <= thumbCacheMaxBytes {
-				s.enqueueCoverBuild(id, retryRequest)
+				s.enqueueCoverBuild(id, false)
 			}
 			if !s.tryAcquireTGShared() {
 				serveThumbUnavailable(w)
@@ -418,6 +429,7 @@ func (s *Server) handleStream(ctx context.Context) http.HandlerFunc {
 		mime := item.MIME
 		size := item.Size
 		s.mu.RUnlock()
+		s.preemptCoversForPlayback()
 		if f, err := os.Open(target); err == nil {
 			defer f.Close()
 			serveStreamFile(w, r, f, filepath.Base(target), mime)

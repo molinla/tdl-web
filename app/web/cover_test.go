@@ -17,7 +17,7 @@ func TestEnqueueCoverBuildDedupesPending(t *testing.T) {
 	s := newHandlerTestServer(t)
 	s.ensureCoverScheduler()
 	s.coverMu.Lock()
-	s.coverActive["hold"] = struct{}{}
+	s.coverActive["hold"] = false
 	s.coverMu.Unlock()
 	s.items["v1"] = &Item{ID: "v1", Type: mediaVideo}
 
@@ -39,7 +39,7 @@ func TestEnqueueCoverBuildPriorityJumpsQueue(t *testing.T) {
 	s := newHandlerTestServer(t)
 	s.ensureCoverScheduler()
 	s.coverMu.Lock()
-	s.coverActive["hold"] = struct{}{}
+	s.coverActive["hold"] = false
 	s.coverMu.Unlock()
 
 	s.items["a"] = &Item{ID: "a", Type: mediaVideo}
@@ -75,7 +75,7 @@ func TestShouldWaitCoverHybrid(t *testing.T) {
 	}
 }
 
-func TestMetadataCoverDoesNotPreemptBackgroundDownload(t *testing.T) {
+func TestVisibleCoverPreemptsBackgroundDownload(t *testing.T) {
 	prev := viper.GetInt(consts.FlagLimit)
 	viper.Set(consts.FlagLimit, 1)
 	defer viper.Set(consts.FlagLimit, prev)
@@ -133,8 +133,11 @@ func TestMetadataCoverDoesNotPreemptBackgroundDownload(t *testing.T) {
 	}
 	select {
 	case id := <-preempted:
-		t.Fatalf("metadata cover unexpectedly preempted %s", id)
-	case <-time.After(100 * time.Millisecond):
+		if id != "bg" {
+			t.Fatalf("preempted=%s want bg", id)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("visible cover did not preempt background download")
 	}
 
 	waitCoverIdle(t, s)
@@ -167,8 +170,6 @@ func TestCoverBandwidthPreemptsAllBackgroundDownloads(t *testing.T) {
 	coverStarted := make(chan struct{})
 	origCover := coverBuildHook
 	coverBuildHook = func(srv *Server, ctx context.Context, id string) error {
-		srv.beginCoverBandwidth(ctx)
-		defer srv.endCoverBandwidth()
 		close(coverStarted)
 		<-coverGate
 		writeTestJPEG(t, srv.thumbCachePath(id))
@@ -227,6 +228,91 @@ func TestCoverBandwidthPreemptsAllBackgroundDownloads(t *testing.T) {
 	close(coverGate)
 	waitCoverIdle(t, s)
 	close(released)
+}
+
+func TestCoverStateReplacesVisibleQueueAndCancelsStaleActive(t *testing.T) {
+	s := newHandlerTestServer(t)
+	s.ensureCoverScheduler()
+	s.items["old"] = &Item{ID: "old", Type: mediaVideo}
+	s.items["new"] = &Item{ID: "new", Type: mediaVideo}
+
+	oldCtx, oldCancel := context.WithCancel(context.Background())
+	s.coverMu.Lock()
+	s.coverActive["old"] = true
+	s.coverCancels["old"] = oldCancel
+	s.coverMu.Unlock()
+
+	s.setCoverState(false, []string{"new", "missing"})
+
+	select {
+	case <-oldCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("stale visible cover was not canceled")
+	}
+
+	s.coverMu.Lock()
+	defer s.coverMu.Unlock()
+	if s.coverPaused {
+		t.Fatal("cover scheduler unexpectedly paused")
+	}
+	if _, ok := s.coverVisible["new"]; !ok || len(s.coverVisible) != 1 {
+		t.Fatalf("visible=%v want only new", s.coverVisible)
+	}
+	if len(s.coverPriQueue) != 1 || s.coverPriQueue[0] != "new" {
+		t.Fatalf("priority queue=%v want [new]", s.coverPriQueue)
+	}
+}
+
+func TestCoverPauseCancelsWithoutFailureCooldownAndResumeRequeues(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s := newHandlerTestServer(t)
+	s.ctx = ctx
+	s.items["video"] = &Item{ID: "video", Type: mediaVideo}
+
+	started := make(chan struct{})
+	origCover := coverBuildHook
+	coverBuildHook = func(_ *Server, ctx context.Context, _ string) error {
+		close(started)
+		<-ctx.Done()
+		return ctx.Err()
+	}
+	defer func() { coverBuildHook = origCover }()
+
+	s.setCoverState(false, []string{"video"})
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("visible cover did not start")
+	}
+
+	s.setCoverState(true, []string{"video"})
+	waitCoverIdle(t, s)
+
+	s.coverMu.Lock()
+	_, failed := s.coverFailed["video"]
+	paused := s.coverPaused
+	s.coverMu.Unlock()
+	if failed {
+		t.Fatal("canceled cover entered failure cooldown")
+	}
+	if !paused {
+		t.Fatal("cover scheduler should be paused")
+	}
+	if pos := s.enqueueCoverBuild("video", true); pos != 0 {
+		t.Fatalf("paused enqueue position=%d want 0", pos)
+	}
+
+	s.coverMu.Lock()
+	s.coverActive["hold"] = false
+	s.coverMu.Unlock()
+	s.setCoverState(false, []string{"video"})
+	s.coverMu.Lock()
+	queued := len(s.coverPriQueue)
+	s.coverMu.Unlock()
+	if queued != 1 {
+		t.Fatalf("resume queued=%d want 1", queued)
+	}
 }
 
 func TestCoverSchedulerUsesIsolatedTGCover(t *testing.T) {

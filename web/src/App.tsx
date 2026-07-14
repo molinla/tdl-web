@@ -24,6 +24,7 @@ import {
   progressPct,
   statusLabel,
   subscribeEvents,
+  updateCoverState,
 } from "./api";
 import { splitIntoColumns } from "./masonry";
 import { registerScrollTarget } from "./scrollNavigation";
@@ -565,8 +566,10 @@ function LazyCover({
   coverPriority = "normal",
   previewSourceId,
   previewHidden,
+  loadingPaused,
   onLoadingChange,
   onReady,
+  onVisibilityChange,
 }: {
   src?: string;
   alt: string;
@@ -578,11 +581,17 @@ function LazyCover({
   coverPriority?: CoverPriority;
   previewSourceId?: string;
   previewHidden?: boolean;
+  loadingPaused?: boolean;
   onLoadingChange?: (id: string, loading: boolean) => void;
   onReady?: (id: string) => void;
+  onVisibilityChange?: (id: string, visible: boolean) => void;
 }) {
   const ref = useRef<HTMLDivElement>(null);
   const lazyRootMargin = useLazyRootMargin();
+  const visibilityMargin =
+    coverPriority === "high"
+      ? `${Math.round((Number.parseFloat(lazyRootMargin) || 0) / VIRTUAL_BUFFER_SCREENS)}px 0px`
+      : lazyRootMargin;
   const cachedCover = Boolean(src && coverLoadCache.has(src));
   const [inView, setInView] = useState(false);
   const [coverState, setCoverState] = useState<CoverState>(
@@ -596,11 +605,11 @@ function LazyCover({
 
   const loadSrc = useMemo(() => {
     if (!src) return "";
-    if (retryAttempt <= 0) return src;
     const u = new URL(src);
-    u.searchParams.set("retry", String(retryAttempt));
+    if (coverPriority === "high") u.searchParams.set("priority", "1");
+    if (retryAttempt > 0) u.searchParams.set("retry", String(retryAttempt));
     return u.toString();
-  }, [src, retryAttempt]);
+  }, [src, retryAttempt, coverPriority]);
 
   function clearRetryTimer() {
     if (retryTimerRef.current != null) {
@@ -612,7 +621,7 @@ function LazyCover({
   function requestRetry() {
     clearRetryTimer();
     setRequestInFlight(false);
-    if (!src || previewHidden || !inViewRef.current) {
+    if (!src || previewHidden || loadingPaused || !inViewRef.current) {
       setCoverState("idle");
       setRetryWaiting(false);
       return;
@@ -659,14 +668,14 @@ function LazyCover({
 
     const io = new IntersectionObserver(
       ([entry]) => setInView(entry.isIntersecting),
-      { rootMargin: lazyRootMargin },
+      { rootMargin: visibilityMargin },
     );
     io.observe(el);
     let raf = 0;
     const checkVisibility = () => {
       window.cancelAnimationFrame(raf);
       raf = window.requestAnimationFrame(() => {
-        setInView(isElementNearViewport(el, lazyRootMargin));
+        setInView(isElementNearViewport(el, visibilityMargin));
       });
     };
     checkVisibility();
@@ -678,10 +687,20 @@ function LazyCover({
       window.removeEventListener("resize", checkVisibility);
       io.disconnect();
     };
-  }, [src, lazyRootMargin]);
+  }, [src, visibilityMargin]);
 
   useEffect(() => {
-    if (!inView || previewHidden) {
+    if (!coverId || coverPriority !== "high" || !onVisibilityChange) return;
+    onVisibilityChange(coverId, inView);
+  }, [coverId, coverPriority, inView, onVisibilityChange]);
+
+  useEffect(() => {
+    if (!coverId || coverPriority !== "high" || !onVisibilityChange) return;
+    return () => onVisibilityChange(coverId, false);
+  }, [coverId, coverPriority, onVisibilityChange]);
+
+  useEffect(() => {
+    if (!inView || previewHidden || loadingPaused) {
       clearRetryTimer();
       setRetryWaiting(false);
       setRequestInFlight(false);
@@ -691,7 +710,7 @@ function LazyCover({
     if (!src || coverState === "loaded" || retryTimerRef.current != null) return;
     const nextState = retryAttempt > 0 ? "retrying" : "loading";
     if (coverState !== nextState) setCoverState(nextState);
-  }, [src, coverState, retryAttempt, previewHidden, inView]);
+  }, [src, coverState, retryAttempt, previewHidden, loadingPaused, inView]);
 
   useEffect(() => {
     return () => {
@@ -716,7 +735,8 @@ function LazyCover({
   const hasSrc = Boolean(loadSrc);
   const cachedReady = Boolean(src && coverLoadCache.has(src));
   const loaded = coverState === "loaded" || cachedReady;
-  const shouldLoad = hasSrc && !loaded && !previewHidden && inView;
+  const shouldLoad =
+    hasSrc && !loaded && !previewHidden && !loadingPaused && inView;
   const showImg = hasSrc && (loaded || shouldLoad);
   const isLoading = shouldLoad;
   const showLoadingFallback = isLoading;
@@ -862,6 +882,9 @@ export default function App() {
   const coverLoadingRef = useRef(new Set<string>());
   const coverReadyIdsRef = useRef(new Set<string>());
   const [coverReadyVersion, setCoverReadyVersion] = useState(0);
+  const visibleVideoCoverIdsRef = useRef(new Set<string>());
+  const coverStateFrameRef = useRef<number | null>(null);
+  const coverPlaybackPausedRef = useRef(false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [file, setFile] = useState<File | null>(null);
@@ -1053,7 +1076,59 @@ export default function App() {
     const fresh = items.find((i) => i.id === player.item.id);
     return fresh ? { ...player, item: fresh } : player;
   }, [player, items]);
+  const coverPlaybackPaused = Boolean(
+    cardOverlayHiddenId || livePlayer?.kind === "video",
+  );
+  coverPlaybackPausedRef.current = coverPlaybackPaused;
   const chromeCollapsed = Boolean(livePlayer || cardOverlayHiddenId);
+
+  const flushCoverState = useCallback((keepalive = false) => {
+    void updateCoverState(
+      coverPlaybackPausedRef.current,
+      Array.from(visibleVideoCoverIdsRef.current),
+      keepalive,
+    ).catch(() => {});
+  }, []);
+
+  const scheduleCoverState = useCallback(() => {
+    if (coverStateFrameRef.current != null) return;
+    coverStateFrameRef.current = window.requestAnimationFrame(() => {
+      coverStateFrameRef.current = null;
+      flushCoverState();
+    });
+  }, [flushCoverState]);
+
+  const onVideoCoverVisibilityChange = useCallback(
+    (id: string, visible: boolean) => {
+      const set = visibleVideoCoverIdsRef.current;
+      if (visible) set.add(id);
+      else set.delete(id);
+      scheduleCoverState();
+    },
+    [scheduleCoverState],
+  );
+
+  useEffect(() => {
+    scheduleCoverState();
+  }, [coverPlaybackPaused, scheduleCoverState]);
+
+  useEffect(() => {
+    const resume = () => {
+      void updateCoverState(false, [], true).catch(() => {});
+    };
+    const restore = () => scheduleCoverState();
+    window.addEventListener("pagehide", resume);
+    window.addEventListener("pageshow", restore);
+    return () => {
+      window.removeEventListener("pagehide", resume);
+      window.removeEventListener("pageshow", restore);
+      if (coverStateFrameRef.current != null) {
+        window.cancelAnimationFrame(coverStateFrameRef.current);
+        coverStateFrameRef.current = null;
+      }
+      resume();
+    };
+  }, [scheduleCoverState]);
 
   // Prefer item.error from SSE as the single play-failure message.
   useEffect(() => {
@@ -1366,8 +1441,10 @@ export default function App() {
                       coverPriority="high"
                       previewSourceId={item.id}
                       previewHidden={livePlayer?.item.id === item.id}
+                      loadingPaused={coverPlaybackPaused}
                       onLoadingChange={onCoverLoadingChange}
                       onReady={onCoverReady}
+                      onVisibilityChange={onVideoCoverVisibilityChange}
                     />
                     <div
                       className={[
@@ -1451,6 +1528,7 @@ export default function App() {
                   aspectRatio={item.cover_aspect}
                   previewSourceId={item.id}
                   previewHidden={livePlayer?.item.id === item.id}
+                  loadingPaused={coverPlaybackPaused}
                   onLoadingChange={onCoverLoadingChange}
                   onReady={onCoverReady}
                 />

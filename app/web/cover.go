@@ -24,8 +24,10 @@ func coverLimit() int {
 
 func (s *Server) ensureCoverScheduler() {
 	s.coverOnce.Do(func() {
+		s.coverVisible = map[string]struct{}{}
 		s.coverPending = map[string]struct{}{}
-		s.coverActive = map[string]struct{}{}
+		s.coverActive = map[string]bool{}
+		s.coverCancels = map[string]context.CancelFunc{}
 		s.coverFailed = map[string]time.Time{}
 		s.coverWake = make(chan struct{}, 1)
 		s.tgCover = make(chan struct{}, coverLimit())
@@ -57,6 +59,9 @@ func (s *Server) enqueueCoverBuild(id string, priority bool) int {
 
 	s.coverMu.Lock()
 	defer s.coverMu.Unlock()
+	if s.coverPaused {
+		return 0
+	}
 
 	if retryAt, ok := s.coverFailed[id]; ok {
 		if time.Now().Before(retryAt) {
@@ -84,6 +89,102 @@ func (s *Server) enqueueCoverBuild(id string, priority bool) int {
 	pos := s.coverPositionLocked(id)
 	s.wakeCoverLocked()
 	return pos
+}
+
+func (s *Server) setCoverState(paused bool, ids []string) {
+	s.ensureCoverScheduler()
+
+	visible := make(map[string]struct{}, len(ids))
+	ordered := make([]string, 0, len(ids))
+	s.mu.RLock()
+	for _, id := range ids {
+		item := s.items[id]
+		if item == nil || item.Type != mediaVideo {
+			continue
+		}
+		if _, ok := visible[id]; ok {
+			continue
+		}
+		visible[id] = struct{}{}
+		if !hasLocalVideoCoverSource(item.TargetPath) && !validThumbCacheFile(s.thumbCachePath(id)) {
+			ordered = append(ordered, id)
+		}
+	}
+	s.mu.RUnlock()
+
+	var cancels []context.CancelFunc
+	s.coverMu.Lock()
+	s.coverPaused = paused
+	s.coverVisible = visible
+	for _, id := range s.coverPriQueue {
+		delete(s.coverPending, id)
+	}
+	for _, id := range s.coverQueue {
+		delete(s.coverPending, id)
+	}
+	s.coverPriQueue = nil
+	s.coverQueue = nil
+
+	for id, priority := range s.coverActive {
+		_, stillVisible := visible[id]
+		if paused || (priority && !stillVisible) || (!priority && len(ordered) > 0) {
+			if cancel := s.coverCancels[id]; cancel != nil {
+				cancels = append(cancels, cancel)
+			}
+		}
+	}
+	if !paused {
+		for i := len(ordered) - 1; i >= 0; i-- {
+			id := ordered[i]
+			if _, active := s.coverActive[id]; active || validThumbCacheFile(s.thumbCachePath(id)) {
+				continue
+			}
+			s.coverPending[id] = struct{}{}
+			s.coverPriQueue = append([]string{id}, s.coverPriQueue...)
+		}
+	}
+	s.coverMu.Unlock()
+
+	for _, cancel := range cancels {
+		cancel()
+	}
+	s.wakeCoverScheduler()
+}
+
+func (s *Server) coverRequestPolicy(id, itemType string, requestedPriority bool) (priority, allowed bool) {
+	s.ensureCoverScheduler()
+	s.coverMu.Lock()
+	defer s.coverMu.Unlock()
+	if s.coverPaused {
+		return false, false
+	}
+	if itemType != mediaVideo {
+		return false, true
+	}
+	_, visible := s.coverVisible[id]
+	return visible || requestedPriority, visible || requestedPriority
+}
+
+func (s *Server) preemptCoversForPlayback() {
+	s.ensureCoverScheduler()
+	var cancels []context.CancelFunc
+	s.coverMu.Lock()
+	for _, id := range s.coverPriQueue {
+		delete(s.coverPending, id)
+	}
+	for _, id := range s.coverQueue {
+		delete(s.coverPending, id)
+	}
+	s.coverPriQueue = nil
+	s.coverQueue = nil
+	for _, cancel := range s.coverCancels {
+		cancels = append(cancels, cancel)
+	}
+	s.coverMu.Unlock()
+	for _, cancel := range cancels {
+		cancel()
+	}
+	s.wakeCoverScheduler()
 }
 
 func (s *Server) removeFromCoverQueueLocked(id string) {
@@ -179,6 +280,7 @@ func (s *Server) tryServeTelegramCover(
 	id string,
 	itemType string,
 	resolved *Item,
+	priority bool,
 	retryRequest bool,
 ) bool {
 	if resolved == nil {
@@ -205,8 +307,8 @@ func (s *Server) tryServeTelegramCover(
 		return false
 	}
 
-	queuePos := s.enqueueCoverBuild(id, retryRequest)
-	if !shouldWaitCover(queuePos, retryRequest) {
+	queuePos := s.enqueueCoverBuild(id, priority)
+	if !shouldWaitCover(queuePos, retryRequest || priority) {
 		return false
 	}
 
@@ -225,12 +327,19 @@ func (s *Server) coverSchedulerLoop() {
 		s.coverMu.Lock()
 		active := len(s.coverActive)
 		var id string
+		var priority bool
 		var ok bool
-		if active < coverLimit() {
-			id, ok = s.popCoverJobLocked()
+		if !s.coverPaused && active < coverLimit() {
+			id, priority, ok = s.popCoverJobLocked()
 			if ok {
-				s.coverActive[id] = struct{}{}
+				s.coverActive[id] = priority
 			}
+		}
+		var jobCtx context.Context
+		var cancel context.CancelFunc
+		if ok {
+			jobCtx, cancel = context.WithCancel(ctx)
+			s.coverCancels[id] = cancel
 		}
 		s.coverMu.Unlock()
 
@@ -243,15 +352,22 @@ func (s *Server) coverSchedulerLoop() {
 			continue
 		}
 
-		go func(jobID string) {
-			runCtx := s.ctx
-			if runCtx == nil {
-				runCtx = context.Background()
+		go func(jobID string, jobPriority bool, runCtx context.Context, cancel context.CancelFunc) {
+			defer cancel()
+			if jobPriority {
+				s.beginCoverBandwidth(runCtx)
+				defer s.endCoverBandwidth()
 			}
-			err := s.ensureThumbCache("thumb:"+jobID, s.thumbCachePath(jobID), func() error {
-				return s.buildCoverFromTelegram(runCtx, jobID)
-			})
-			cooldown := err != nil && s.shouldCooldownCoverFailure(jobID)
+			var err error
+			if runCtx.Err() != nil {
+				err = runCtx.Err()
+			} else {
+				err = s.ensureThumbCache("thumb:"+jobID, s.thumbCachePath(jobID), func() error {
+					return s.buildCoverFromTelegram(runCtx, jobID)
+				})
+			}
+			canceled := errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+			cooldown := err != nil && !canceled && s.shouldCooldownCoverFailure(jobID)
 			s.coverMu.Lock()
 			if cooldown {
 				s.coverFailed[jobID] = time.Now().Add(coverFailureCooldown)
@@ -259,10 +375,11 @@ func (s *Server) coverSchedulerLoop() {
 				delete(s.coverFailed, jobID)
 			}
 			delete(s.coverActive, jobID)
+			delete(s.coverCancels, jobID)
 			delete(s.coverPending, jobID)
 			s.coverMu.Unlock()
 			s.wakeCoverScheduler()
-		}(id)
+		}(id, priority, jobCtx, cancel)
 	}
 }
 
@@ -273,12 +390,12 @@ func (s *Server) shouldCooldownCoverFailure(id string) bool {
 	return item != nil && item.Type == mediaVideo && item.thumb == nil && item.media != nil
 }
 
-func (s *Server) popCoverJobLocked() (string, bool) {
+func (s *Server) popCoverJobLocked() (string, bool, bool) {
 	for len(s.coverPriQueue) > 0 {
 		id := s.coverPriQueue[0]
 		s.coverPriQueue = s.coverPriQueue[1:]
 		if s.itemNeedsCoverBuild(id) {
-			return id, true
+			return id, true, true
 		}
 		delete(s.coverPending, id)
 	}
@@ -286,11 +403,11 @@ func (s *Server) popCoverJobLocked() (string, bool) {
 		id := s.coverQueue[0]
 		s.coverQueue = s.coverQueue[1:]
 		if s.itemNeedsCoverBuild(id) {
-			return id, true
+			return id, false, true
 		}
 		delete(s.coverPending, id)
 	}
-	return "", false
+	return "", false, false
 }
 
 func (s *Server) itemNeedsCoverBuild(id string) bool {
@@ -301,6 +418,15 @@ func (s *Server) itemNeedsCoverBuild(id string) bool {
 	item := s.items[id]
 	s.mu.RUnlock()
 	return item != nil
+}
+
+func hasLocalVideoCoverSource(target string) bool {
+	for _, path := range []string{target, target + tempExt} {
+		if st, err := os.Stat(path); err == nil && st.Size() >= posterMinLocalBytes {
+			return true
+		}
+	}
+	return false
 }
 
 func (s *Server) acquireTGCover(ctx context.Context) bool {
@@ -345,7 +471,9 @@ func (s *Server) buildCoverFromTelegram(ctx context.Context, id string) error {
 
 	resolved, err := s.ensureMedia(ctx, id)
 	if err != nil {
-		s.markItemError(id, err)
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			s.markItemError(id, err)
+		}
 		return err
 	}
 	if resolved == nil {
@@ -377,8 +505,6 @@ func (s *Server) buildCoverFromTelegram(ctx context.Context, id string) error {
 			return ctx.Err()
 		}
 		defer s.releaseTGCover()
-		s.beginCoverBandwidth(ctx)
-		defer s.endCoverBandwidth()
 		return s.extractRemoteVideoPoster(ctx, resolved.media, thumbPath)
 	}
 

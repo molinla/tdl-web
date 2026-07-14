@@ -89,6 +89,23 @@ export async function pauseItem(id: string): Promise<void> {
   if (!res.ok) throw new Error(await res.text());
 }
 
+export async function updateCoverState(
+  paused: boolean,
+  visibleVideoIds: string[],
+  keepalive = false,
+): Promise<void> {
+  const res = await fetch(apiURL("/api/covers/state"), {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({
+      paused,
+      visible_video_ids: visibleVideoIds,
+    }),
+    keepalive,
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 export async function downloadItems(ids: string[]): Promise<void> {
   const res = await fetch(apiURL("/api/items/download"), {
     method: "POST",

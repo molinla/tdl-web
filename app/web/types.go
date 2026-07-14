@@ -144,10 +144,13 @@ type Server struct {
 	// Cover build scheduler (isolated tgCover slots; does not share tgShared).
 	coverOnce     sync.Once
 	coverMu       sync.Mutex
+	coverPaused   bool
+	coverVisible  map[string]struct{}
 	coverPriQueue []string
 	coverQueue    []string
 	coverPending  map[string]struct{}
-	coverActive   map[string]struct{}
+	coverActive   map[string]bool
+	coverCancels  map[string]context.CancelFunc
 	coverFailed   map[string]time.Time
 	coverWake     chan struct{}
 	tgCover       chan struct{}

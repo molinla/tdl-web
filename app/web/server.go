@@ -77,6 +77,7 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	api.HandleFunc("/import", s.handleImport(ctx)).Methods(http.MethodPost, http.MethodOptions)
 	api.HandleFunc("/items", s.handleItems).Methods(http.MethodGet, http.MethodOptions)
 	api.HandleFunc("/items/download", s.handleDownload(ctx)).Methods(http.MethodPost, http.MethodOptions)
+	api.HandleFunc("/covers/state", s.handleCoverState).Methods(http.MethodPost, http.MethodOptions)
 	api.HandleFunc("/items/{id}/thumb", s.handleThumb(ctx)).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)
 	api.HandleFunc("/items/{id}/preview", s.handlePreview(ctx)).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)
 	api.HandleFunc("/items/{id}/stream", s.handleStream(ctx)).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)

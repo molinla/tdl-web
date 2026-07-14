@@ -62,6 +62,7 @@ func TestHandleThumbUsesDiskCacheWithoutDownloadQueue(t *testing.T) {
 		TargetPath: filepath.Join(s.opts.Dir, "missing.mp4"),
 		MIME:       "video/mp4",
 	}
+	s.setCoverState(true, nil)
 
 	rr := serveWithID(s.handleThumb(context.Background()), id)
 	if rr.Code != http.StatusOK {
@@ -69,6 +70,76 @@ func TestHandleThumbUsesDiskCacheWithoutDownloadQueue(t *testing.T) {
 	}
 	if got := s.pendingDownloadCount(); got != 0 {
 		t.Fatalf("pending downloads=%d, want 0", got)
+	}
+}
+
+func TestHandleThumbPausedSkipsRemoteCover(t *testing.T) {
+	s := newHandlerTestServer(t)
+	id := "remote-video"
+	s.items[id] = &Item{
+		ID:         id,
+		Type:       mediaVideo,
+		Status:     statusQueued,
+		TargetPath: filepath.Join(s.opts.Dir, "missing.mp4"),
+		MIME:       "video/mp4",
+	}
+	s.setCoverState(true, []string{id})
+
+	req := httptest.NewRequest(http.MethodGet, "/api/items/"+id+"/thumb?priority=1", nil)
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rr := httptest.NewRecorder()
+	s.handleThumb(context.Background()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	s.coverMu.Lock()
+	queued := len(s.coverPriQueue) + len(s.coverQueue)
+	s.coverMu.Unlock()
+	if queued != 0 {
+		t.Fatalf("paused cover queued=%d want 0", queued)
+	}
+}
+
+func TestHandleStreamPreemptsActiveCover(t *testing.T) {
+	s := newHandlerTestServer(t)
+	id := "local-video"
+	target := filepath.Join(s.opts.Dir, "video.mp4")
+	if err := os.MkdirAll(filepath.Dir(target), defaultCachePerm); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(target, []byte("abcdef"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s.items[id] = &Item{
+		ID:         id,
+		Type:       mediaVideo,
+		Status:     statusCompleted,
+		TargetPath: target,
+		MIME:       "video/mp4",
+		Size:       6,
+	}
+
+	coverCtx, coverCancel := context.WithCancel(context.Background())
+	s.ensureCoverScheduler()
+	s.coverMu.Lock()
+	s.coverActive["cover"] = false
+	s.coverCancels["cover"] = coverCancel
+	s.coverMu.Unlock()
+
+	req := httptest.NewRequest(http.MethodGet, "/api/items/"+id+"/stream", nil)
+	req.Header.Set("Range", "bytes=0-0")
+	req = mux.SetURLVars(req, map[string]string{"id": id})
+	rr := httptest.NewRecorder()
+	s.handleStream(context.Background()).ServeHTTP(rr, req)
+
+	if rr.Code != http.StatusPartialContent {
+		t.Fatalf("status=%d body=%q", rr.Code, rr.Body.String())
+	}
+	select {
+	case <-coverCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("playback did not cancel active cover")
 	}
 }
 
