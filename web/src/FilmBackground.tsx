@@ -22,6 +22,8 @@ const FILM_BASE_OPACITY = 0.17;
 const FILM_OBSCURED_OPACITY = 0.2;
 const FILM_BLUR_PX = 26;
 const MAX_DPR = 1.5;
+const FILM_CACHE_PIXEL_BUDGET = 8_000_000;
+const FILM_CACHE_MIN_SCALE = 0.25;
 
 type FilmFrameData = {
   item: Item;
@@ -33,6 +35,15 @@ type FilmLayerData = {
   columnFrames: FilmFrameData[][];
   coverCount: number;
   urls: string[];
+};
+
+type RenderedFilmColumn = {
+  canvas: HTMLCanvasElement;
+};
+
+type RenderedFilmLayer = {
+  signature: string;
+  columns: Array<RenderedFilmColumn | null>;
 };
 
 type FilmMotionPhase = "idle" | "accelerating" | "obscured" | "decelerating";
@@ -181,6 +192,27 @@ function computeMetrics(width: number, height: number): FilmMetrics {
   };
 }
 
+function renderedLayerSizeKey(size: CanvasSize): string {
+  return `${size.width}x${size.height}`;
+}
+
+function renderedLayerScale(
+  layer: FilmLayerData,
+  metrics: FilmMetrics,
+): number {
+  const pixels = layer.columnFrames.reduce(
+    (sum, frames) =>
+      sum + metrics.columnWidth * metrics.pitch * frames.length,
+    0,
+  );
+  if (pixels <= FILM_CACHE_PIXEL_BUDGET) return 1;
+  return clamp(
+    Math.sqrt(FILM_CACHE_PIXEL_BUDGET / pixels),
+    FILM_CACHE_MIN_SCALE,
+    1,
+  );
+}
+
 function objectFitCoverRect(
   image: HTMLImageElement,
   dx: number,
@@ -236,6 +268,10 @@ export function FilmBackground({
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const activeLayerRef = useRef<FilmLayerData>(buildFilmLayer(items));
   const pendingLayerRef = useRef<FilmLayerData | null>(null);
+  const activeRenderedLayerRef = useRef<RenderedFilmLayer | null>(null);
+  const pendingRenderedLayerRef = useRef<RenderedFilmLayer | null>(null);
+  const activeRenderTokenRef = useRef(0);
+  const pendingRenderTokenRef = useRef(0);
   const pendingLayerReadyRef = useRef(false);
   const motionPhaseRef = useRef<FilmMotionPhase>("idle");
   const motionPhaseStartRef = useRef(0);
@@ -248,6 +284,7 @@ export function FilmBackground({
   const lastPointerRef = useRef<{ x: number; y: number } | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastFrameRef = useRef<number | null>(null);
+  const canvasSizeRef = useRef<CanvasSize | null>(null);
   const obscureTimerRef = useRef<number | null>(null);
   const holdTimerRef = useRef<number | null>(null);
   const endTimerRef = useRef<number | null>(null);
@@ -265,6 +302,94 @@ export function FilmBackground({
     return Promise.all(layer.urls.map((url) => ensureImage(url).promise)).then(
       () => undefined,
     );
+  }
+
+  function yieldToIdle(): Promise<void> {
+    return new Promise((resolve) => {
+      if (typeof window.requestIdleCallback === "function") {
+        window.requestIdleCallback(() => resolve());
+      } else {
+        window.setTimeout(resolve, 0);
+      }
+    });
+  }
+
+  function releaseRenderedColumns(
+    columns: Array<RenderedFilmColumn | null>,
+  ) {
+    for (const column of columns) {
+      if (!column) continue;
+      column.canvas.width = 0;
+      column.canvas.height = 0;
+    }
+  }
+
+  function scheduleRenderedLayerRelease(layer: RenderedFilmLayer | null) {
+    if (!layer) return;
+    const release = () => releaseRenderedColumns(layer.columns);
+    if (typeof window.requestIdleCallback === "function") {
+      window.requestIdleCallback(release);
+    } else {
+      window.setTimeout(release, 0);
+    }
+  }
+
+  async function buildRenderedLayer(
+    layer: FilmLayerData,
+    tokenRef: { current: number },
+  ): Promise<RenderedFilmLayer | null> {
+    const token = (tokenRef.current += 1);
+    await preloadLayer(layer);
+    if (tokenRef.current !== token) return null;
+
+    const canvas = canvasRef.current;
+    if (!canvas) return null;
+    const size = canvasSizeRef.current ?? resizeCanvas(canvas);
+    const sizeKey = renderedLayerSizeKey(size);
+    const metrics = computeMetrics(size.width, size.height);
+    const scale = renderedLayerScale(layer, metrics);
+    const columns: Array<RenderedFilmColumn | null> = Array(
+      COLUMN_COUNT,
+    ).fill(null);
+
+    for (let colIndex = 0; colIndex < COLUMN_COUNT; colIndex += 1) {
+      await yieldToIdle();
+      if (tokenRef.current !== token) {
+        scheduleRenderedLayerRelease({ signature: layer.signature, columns });
+        return null;
+      }
+      const frames = layer.columnFrames[colIndex] ?? [];
+      if (frames.length > 0) {
+        const cycle = metrics.pitch * frames.length;
+        const column = document.createElement("canvas");
+        column.width = Math.max(1, Math.round(metrics.columnWidth * scale));
+        column.height = Math.max(1, Math.round(cycle * scale));
+        const ctx = column.getContext("2d");
+        if (ctx) {
+          ctx.setTransform(scale, 0, 0, scale, 0, 0);
+          for (let frameIndex = 0; frameIndex < frames.length; frameIndex += 1) {
+            drawFrame(
+              ctx,
+              frames[frameIndex],
+              frameIndex,
+              0,
+              frameIndex * metrics.pitch,
+              metrics,
+            );
+          }
+          columns[colIndex] = { canvas: column };
+        }
+      }
+    }
+
+    if (
+      tokenRef.current !== token ||
+      renderedLayerSizeKey(canvasSizeRef.current ?? size) !== sizeKey
+    ) {
+      scheduleRenderedLayerRelease({ signature: layer.signature, columns });
+      return null;
+    }
+    return { signature: layer.signature, columns };
   }
 
   function clearMotionTimers() {
@@ -289,13 +414,25 @@ export function FilmBackground({
 
   function swapPendingLayer() {
     const pending = pendingLayerRef.current;
-    if (!pending || pending.coverCount <= 0 || !pendingLayerReadyRef.current) {
+    const rendered = pendingRenderedLayerRef.current;
+    if (
+      !pending ||
+      !rendered ||
+      pending.coverCount <= 0 ||
+      !pendingLayerReadyRef.current
+    ) {
       return false;
     }
 
+    const previousRendered = activeRenderedLayerRef.current;
     activeLayerRef.current = pending;
+    activeRenderedLayerRef.current = rendered;
     pendingLayerRef.current = null;
+    pendingRenderedLayerRef.current = null;
     pendingLayerReadyRef.current = false;
+    if (previousRendered !== rendered) {
+      scheduleRenderedLayerRelease(previousRendered);
+    }
     return true;
   }
 
@@ -368,19 +505,33 @@ export function FilmBackground({
     const token = (initialTokenRef.current += 1);
     if (reducedMotionRef.current) {
       initialPhaseRef.current = "done";
-      return;
+    } else {
+      initialPhaseRef.current = "waiting";
     }
-    initialPhaseRef.current = "waiting";
-    preloadLayer(layer).then(() => {
-      if (initialTokenRef.current !== token) return;
-      startInitialEnter();
+    void buildRenderedLayer(layer, activeRenderTokenRef).then((rendered) => {
+      if (
+        !rendered ||
+        initialTokenRef.current !== token ||
+        activeLayerRef.current.signature !== layer.signature
+      ) {
+        return;
+      }
+      const previous = activeRenderedLayerRef.current;
+      activeRenderedLayerRef.current = rendered;
+      if (previous !== rendered) {
+        scheduleRenderedLayerRelease(previous);
+      }
+      if (!reducedMotionRef.current) startInitialEnter();
     });
   }
 
-  function ensureCanvasSize(canvas: HTMLCanvasElement): CanvasSize {
-    const rect = canvas.getBoundingClientRect();
-    const width = Math.max(1, Math.round(rect.width || window.innerWidth));
-    const height = Math.max(1, Math.round(rect.height || window.innerHeight));
+  function resizeCanvas(
+    canvas: HTMLCanvasElement,
+    cssWidth = canvas.clientWidth,
+    cssHeight = canvas.clientHeight,
+  ): CanvasSize {
+    const width = Math.max(1, Math.round(cssWidth || window.innerWidth));
+    const height = Math.max(1, Math.round(cssHeight || window.innerHeight));
     const dpr = Math.min(window.devicePixelRatio || 1, MAX_DPR);
     const pixelWidth = Math.round(width * dpr);
     const pixelHeight = Math.round(height * dpr);
@@ -388,7 +539,9 @@ export function FilmBackground({
       canvas.width = pixelWidth;
       canvas.height = pixelHeight;
     }
-    return { width, height, dpr };
+    const size = { width, height, dpr };
+    canvasSizeRef.current = size;
+    return size;
   }
 
   function isSidePoint(clientX: number) {
@@ -414,7 +567,7 @@ export function FilmBackground({
     if (initialPhaseRef.current === "waiting") return null;
     const canvas = canvasRef.current;
     if (!canvas) return null;
-    const size = ensureCanvasSize(canvas);
+    const size = canvasSizeRef.current ?? resizeCanvas(canvas);
     const metrics = computeMetrics(size.width, size.height);
     const layer = activeLayerRef.current;
     if (layer.coverCount <= 0) return null;
@@ -616,6 +769,49 @@ export function FilmBackground({
     );
   }
 
+  function drawRenderedColumns(
+    ctx: CanvasRenderingContext2D,
+    layer: FilmLayerData,
+    rendered: RenderedFilmLayer | null,
+    metrics: FilmMetrics,
+    now: number,
+  ): boolean {
+    if (!rendered || rendered.signature !== layer.signature) return false;
+    for (let colIndex = 0; colIndex < COLUMN_COUNT; colIndex += 1) {
+      const frames = layer.columnFrames[colIndex] ?? [];
+      if (frames.length > 0 && !rendered.columns[colIndex]) return false;
+    }
+
+    const colStep = metrics.columnWidth + metrics.columnGap;
+    for (let colIndex = 0; colIndex < COLUMN_COUNT; colIndex += 1) {
+      const frames = layer.columnFrames[colIndex] ?? [];
+      const column = rendered.columns[colIndex];
+      if (!column || frames.length === 0) continue;
+
+      const x = colIndex * colStep;
+      const cycle = metrics.pitch * frames.length;
+      const offset = mod(offsetsRef.current[colIndex], cycle);
+      const introDelta = columnIntroDelta(colIndex, metrics, now);
+      let y = -offset + introDelta;
+      while (y > 0) y -= cycle;
+      while (y + cycle < 0) y += cycle;
+      for (; y < metrics.filmSize; y += cycle) {
+        ctx.drawImage(
+          column.canvas,
+          0,
+          0,
+          column.canvas.width,
+          column.canvas.height,
+          x,
+          y,
+          metrics.columnWidth,
+          cycle,
+        );
+      }
+    }
+    return true;
+  }
+
   function draw(now: number, size: CanvasSize) {
     const canvas = canvasRef.current;
     if (!canvas) return;
@@ -642,32 +838,37 @@ export function FilmBackground({
     ctx.fillStyle = "rgba(229, 9, 20, 0.025)";
     ctx.fillRect(0, 0, metrics.filmSize, metrics.filmSize);
 
-    const colStep = metrics.columnWidth + metrics.columnGap;
-    for (let colIndex = 0; colIndex < COLUMN_COUNT; colIndex += 1) {
-      const frames = layer.columnFrames[colIndex] ?? [];
-      if (!frames.length) continue;
+    if (
+      !drawRenderedColumns(
+        ctx,
+        layer,
+        activeRenderedLayerRef.current,
+        metrics,
+        now,
+      )
+    ) {
+      const colStep = metrics.columnWidth + metrics.columnGap;
+      for (let colIndex = 0; colIndex < COLUMN_COUNT; colIndex += 1) {
+        const frames = layer.columnFrames[colIndex] ?? [];
+        if (!frames.length) continue;
 
-      const x = colIndex * colStep;
-      const cycle = metrics.pitch * frames.length;
-      const offset = mod(offsetsRef.current[colIndex], cycle);
-      const introDelta = columnIntroDelta(colIndex, metrics, now);
-      const first = Math.floor((-metrics.frameHeight - introDelta + offset) / metrics.pitch);
-
-      for (let n = first; ; n += 1) {
-        const y = n * metrics.pitch - offset + introDelta;
-        if (y > metrics.filmSize) break;
-        if (y + metrics.frameHeight < 0) continue;
-        const frameIndex = mod(n, frames.length);
-        const frame = frames[frameIndex];
-        if (!frame) continue;
-        drawFrame(
-          ctx,
-          frame,
-          frameIndex,
-          x,
-          y,
-          metrics,
+        const x = colIndex * colStep;
+        const cycle = metrics.pitch * frames.length;
+        const offset = mod(offsetsRef.current[colIndex], cycle);
+        const introDelta = columnIntroDelta(colIndex, metrics, now);
+        const first = Math.floor(
+          (-metrics.frameHeight - introDelta + offset) / metrics.pitch,
         );
+
+        for (let n = first; ; n += 1) {
+          const y = n * metrics.pitch - offset + introDelta;
+          if (y > metrics.filmSize) break;
+          if (y + metrics.frameHeight < 0) continue;
+          const frameIndex = mod(n, frames.length);
+          const frame = frames[frameIndex];
+          if (!frame) continue;
+          drawFrame(ctx, frame, frameIndex, x, y, metrics);
+        }
       }
     }
 
@@ -679,6 +880,9 @@ export function FilmBackground({
     if (reducedMotion) {
       initialPhaseRef.current = "done";
       pendingLayerRef.current = null;
+      scheduleRenderedLayerRelease(pendingRenderedLayerRef.current);
+      pendingRenderedLayerRef.current = null;
+      pendingRenderTokenRef.current += 1;
       pendingLayerReadyRef.current = false;
       clearMotionTimers();
       setMotionPhase("idle");
@@ -700,22 +904,34 @@ export function FilmBackground({
 
     if (current.signature === nextLayer.signature) {
       activeLayerRef.current = nextLayer;
-      void preloadLayer(nextLayer);
       return;
     }
 
     if (reducedMotionRef.current || initialPhaseRef.current !== "done") {
       activeLayerRef.current = nextLayer;
+      scheduleRenderedLayerRelease(activeRenderedLayerRef.current);
+      activeRenderedLayerRef.current = null;
       pendingLayerRef.current = null;
+      scheduleRenderedLayerRelease(pendingRenderedLayerRef.current);
+      pendingRenderedLayerRef.current = null;
+      pendingRenderTokenRef.current += 1;
       pendingLayerReadyRef.current = false;
-      if (initialPhaseRef.current !== "done") waitForInitialLayer(nextLayer);
+      waitForInitialLayer(nextLayer);
       return;
     }
 
     pendingLayerRef.current = nextLayer;
+    scheduleRenderedLayerRelease(pendingRenderedLayerRef.current);
+    pendingRenderedLayerRef.current = null;
     pendingLayerReadyRef.current = false;
-    preloadLayer(nextLayer).then(() => {
-      if (pendingLayerRef.current?.signature !== nextLayer.signature) return;
+    void buildRenderedLayer(nextLayer, pendingRenderTokenRef).then((rendered) => {
+      if (
+        !rendered ||
+        pendingLayerRef.current?.signature !== nextLayer.signature
+      ) {
+        return;
+      }
+      pendingRenderedLayerRef.current = rendered;
       pendingLayerReadyRef.current = true;
       trySwapAndRecover();
     });
@@ -766,6 +982,81 @@ export function FilmBackground({
   }, []);
 
   useEffect(() => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    const rebuildRenderedLayers = () => {
+      const active = activeLayerRef.current;
+      if (initialPhaseRef.current === "waiting") {
+        waitForInitialLayer(active);
+      } else {
+        void buildRenderedLayer(active, activeRenderTokenRef).then(
+          (rendered) => {
+            if (
+              rendered &&
+              activeLayerRef.current.signature === active.signature
+            ) {
+              const previous = activeRenderedLayerRef.current;
+              activeRenderedLayerRef.current = rendered;
+              if (previous !== rendered) {
+                scheduleRenderedLayerRelease(previous);
+              }
+            }
+          },
+        );
+      }
+
+      const pending = pendingLayerRef.current;
+      if (!pending) return;
+      scheduleRenderedLayerRelease(pendingRenderedLayerRef.current);
+      pendingRenderedLayerRef.current = null;
+      pendingLayerReadyRef.current = false;
+      void buildRenderedLayer(pending, pendingRenderTokenRef).then(
+        (rendered) => {
+          if (
+            !rendered ||
+            pendingLayerRef.current?.signature !== pending.signature
+          ) {
+            return;
+          }
+          pendingRenderedLayerRef.current = rendered;
+          pendingLayerReadyRef.current = true;
+          trySwapAndRecover();
+        },
+      );
+    };
+    const update = (
+      cssWidth = canvas.clientWidth,
+      cssHeight = canvas.clientHeight,
+    ) => {
+      const previous = canvasSizeRef.current;
+      const size = resizeCanvas(canvas, cssWidth, cssHeight);
+      if (
+        previous &&
+        previous.width === size.width &&
+        previous.height === size.height
+      ) {
+        return;
+      }
+      rebuildRenderedLayers();
+    };
+    const observer = new ResizeObserver(([entry]) => {
+      if (entry) {
+        update(entry.contentRect.width, entry.contentRect.height);
+      }
+    });
+    const updateFromWindow = () => update();
+
+    update();
+    observer.observe(canvas);
+    window.addEventListener("resize", updateFromWindow);
+    return () => {
+      observer.disconnect();
+      window.removeEventListener("resize", updateFromWindow);
+      canvasSizeRef.current = null;
+    };
+  }, []);
+
+  useEffect(() => {
     const tick = (now: number) => {
       if (!tabVisibleRef.current) {
         rafRef.current = window.requestAnimationFrame(tick);
@@ -776,7 +1067,7 @@ export function FilmBackground({
         rafRef.current = window.requestAnimationFrame(tick);
         return;
       }
-      const size = ensureCanvasSize(canvas);
+      const size = canvasSizeRef.current ?? resizeCanvas(canvas);
       const last = lastFrameRef.current ?? now;
       const dt = Math.min((now - last) / 1000, 0.05);
       lastFrameRef.current = now;
@@ -835,6 +1126,17 @@ export function FilmBackground({
 
   useEffect(() => {
     return () => {
+      initialTokenRef.current += 1;
+      activeRenderTokenRef.current += 1;
+      pendingRenderTokenRef.current += 1;
+      releaseRenderedColumns(
+        activeRenderedLayerRef.current?.columns ?? [],
+      );
+      releaseRenderedColumns(
+        pendingRenderedLayerRef.current?.columns ?? [],
+      );
+      activeRenderedLayerRef.current = null;
+      pendingRenderedLayerRef.current = null;
       clearMotionTimers();
       if (initialEndTimerRef.current != null) {
         window.clearTimeout(initialEndTimerRef.current);
