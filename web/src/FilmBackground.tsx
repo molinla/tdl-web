@@ -1076,7 +1076,11 @@ export function FilmBackground({
       const visuals = reducedMotionRef.current
         ? { blur: 0, opacity: FILM_BASE_OPACITY, speed: 0 }
         : motionVisuals(now);
-      const targetSpeed = sideHoverRef.current ? 0 : visuals.speed;
+      const hoverPaused =
+        sideHoverRef.current &&
+        motionPhaseRef.current === "idle" &&
+        initialPhaseRef.current === "done";
+      const targetSpeed = hoverPaused ? 0 : visuals.speed;
       const ease = 1 - Math.exp(-dt / 0.22);
       speedMultiplierRef.current +=
         (targetSpeed - speedMultiplierRef.current) * ease;

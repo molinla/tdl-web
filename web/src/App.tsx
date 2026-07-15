@@ -10,6 +10,7 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
+import { CloudDownload } from "lucide-react";
 import {
   cacheItem,
   displayName,
@@ -751,10 +752,6 @@ function LazyCover({
     setRequestInFlight(true);
   }, [loadSrc, retryWaiting, shouldLoad]);
 
-  const loadingLabel =
-    retryAttempt > 0 || coverState === "retrying"
-      ? "重试封面…"
-      : "加载封面…";
   const knownAspect =
     (coverId ? coverAspectCache.get(coverId) : undefined) ??
     aspectRatio ??
@@ -810,7 +807,6 @@ function LazyCover({
           {showLoadingFallback ? (
             <span className="cover-loading-label">
               <NetflixSpinner />
-              <span>{loadingLabel}</span>
             </span>
           ) : (
             fallbackText
@@ -881,7 +877,6 @@ export default function App() {
   const [coverLoadingCount, setCoverLoadingCount] = useState(0);
   const coverLoadingRef = useRef(new Set<string>());
   const coverReadyIdsRef = useRef(new Set<string>());
-  const [coverReadyVersion, setCoverReadyVersion] = useState(0);
   const visibleVideoCoverIdsRef = useRef(new Set<string>());
   const coverStateFrameRef = useRef<number | null>(null);
   const coverPlaybackPausedRef = useRef(false);
@@ -911,12 +906,6 @@ export default function App() {
     if (loading) set.add(id);
     else set.delete(id);
     setCoverLoadingCount(set.size);
-  }, []);
-  const onCoverReady = useCallback((id: string) => {
-    const set = coverReadyIdsRef.current;
-    if (set.has(id)) return;
-    set.add(id);
-    setCoverReadyVersion((version) => version + 1);
   }, []);
   const applyPayload = (payload: ItemsPayload) => {
     setItems(payload.items ?? []);
@@ -975,14 +964,11 @@ export default function App() {
     () => displayItems.filter((i) => i.type === "file"),
     [displayItems],
   );
-  const mediaItems = useMemo(() => [...videos, ...images], [videos, images]);
   const previewMediaItems = useMemo(
     () => displayItems.filter((i) => i.type === "video" || i.type === "image"),
     [displayItems],
   );
-  const [viewportBackgroundItems, setViewportBackgroundItems] = useState<Item[]>(
-    [],
-  );
+  const [backgroundItems, setBackgroundItems] = useState<Item[]>([]);
   const pendingVideoBackgroundStageRef = useRef<number | null>(null);
   const pendingImageBackgroundStageRef = useRef<number | null>(null);
   const backgroundSettleTimerRef = useRef<number | null>(null);
@@ -999,9 +985,6 @@ export default function App() {
       const imageStage = pendingImageBackgroundStageRef.current;
       const videoItems = stageItems(videos, videoStage);
       const imageItems = stageItems(images, imageStage);
-      const next = uniqueItems([...videoItems, ...imageItems]);
-      if (next.length === 0) return;
-
       const stageKey = [
         videoItems.length > 0 && videoStage != null ? `video:${videoStage}` : "",
         imageItems.length > 0 && imageStage != null ? `image:${imageStage}` : "",
@@ -1009,10 +992,26 @@ export default function App() {
         .filter(Boolean)
         .join("|");
       if (!stageKey || stageKey === backgroundStageKeyRef.current) return;
+
+      const next = uniqueItems([...videoItems, ...imageItems]).filter((item) =>
+        coverReadyIdsRef.current.has(item.id),
+      );
+      if (next.length === 0) return;
+
       backgroundStageKeyRef.current = stageKey;
-      setViewportBackgroundItems(next);
+      setBackgroundItems(next);
     }, FILM_BACKGROUND_SETTLE_MS);
   }, [images, videos]);
+
+  const onCoverReady = useCallback(
+    (id: string) => {
+      const set = coverReadyIdsRef.current;
+      if (set.has(id)) return;
+      set.add(id);
+      scheduleBackgroundItemsUpdate();
+    },
+    [scheduleBackgroundItemsUpdate],
+  );
 
   const handleVideoVirtualItemsChange = useCallback(
     (entries: VirtualWindowEntry[]) => {
@@ -1054,23 +1053,6 @@ export default function App() {
     };
   }, []);
 
-  const effectiveBackgroundItems = useMemo(() => {
-    if (viewportBackgroundItems.length === 0) return mediaItems;
-
-    const freshById = new Map(mediaItems.map((item) => [item.id, item]));
-    const freshViewportItems = viewportBackgroundItems
-      .map((item) => freshById.get(item.id))
-      .filter((item): item is Item => item != null);
-
-    return freshViewportItems.length > 0 ? freshViewportItems : mediaItems;
-  }, [mediaItems, viewportBackgroundItems]);
-  const backgroundReadyItems = useMemo(
-    () =>
-      effectiveBackgroundItems.filter((item) =>
-        coverReadyIdsRef.current.has(item.id),
-      ),
-    [coverReadyVersion, effectiveBackgroundItems],
-  );
   const livePlayer = useMemo(() => {
     if (!player) return null;
     const fresh = items.find((i) => i.id === player.item.id);
@@ -1288,9 +1270,9 @@ export default function App() {
 
   return (
     <>
-      {apiReady && backgroundReadyItems.length > 0 && (
+      {apiReady && backgroundItems.length > 0 && (
         <FilmBackground
-          items={backgroundReadyItems}
+          items={backgroundItems}
           onItemClick={openFilmPlayer}
         />
       )}
@@ -1304,7 +1286,7 @@ export default function App() {
       >
         <div className="topbar-inner">
           <div className="brand">
-            tdl <span>PREVIEW</span>
+            BOC <span>PREVIEW</span>
           </div>
           <StatusBar
             apiReady={apiReady}
@@ -1456,24 +1438,35 @@ export default function App() {
                         .filter(Boolean)
                         .join(" ")}
                     >
-                      <div className="card-title">{displayName(item)}</div>
-                      <div className="card-meta">
-                        <div className="card-sub">
-                          {[
-                            formatMessageDate(item.date),
-                            formatDuration(item.duration),
-                            formatSize(item.size),
-                          ]
-                            .filter(Boolean)
-                            .join(" · ")}
-                        </div>
-                        {item.status === "queued" && (
-                          <div className="card-status">
-                            {(item.queue_pos ?? 0) > VIDEO_QUEUE_DISPLAY_LIMIT
-                              ? "未下载"
-                              : statusLabel(item)}
+                      <div className="card-overlay-inner">
+                        <div className="card-title">{displayName(item)}</div>
+                        <div className="card-meta">
+                          <div className="card-sub">
+                            {[
+                              formatMessageDate(item.date),
+                              formatDuration(item.duration),
+                              formatSize(item.size),
+                            ]
+                              .filter(Boolean)
+                              .join(" · ")}
                           </div>
-                        )}
+                          {item.status === "queued" && (
+                            <div className="card-status">
+                              {(item.queue_pos ?? 0) > 0 &&
+                              (item.queue_pos ?? 0) <=
+                                VIDEO_QUEUE_DISPLAY_LIMIT ? (
+                                statusLabel(item)
+                              ) : (
+                                <CloudDownload
+                                  className="card-cloud-icon"
+                                  size={14}
+                                  strokeWidth={2}
+                                  aria-label="未缓存"
+                                />
+                              )}
+                            </div>
+                          )}
+                        </div>
                       </div>
                       {(item.status === "caching" ||
                         item.status === "paused" ||

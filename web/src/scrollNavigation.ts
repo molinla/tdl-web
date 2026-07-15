@@ -290,3 +290,16 @@ export function buildRailLayout(
 export function railHeightPx(viewportHeight: number): number {
   return Math.round(Math.max(280, viewportHeight * RAIL_HEIGHT_RATIO));
 }
+
+export function railBatchIndexAtPosition(
+  position: number,
+  sectionHeight: number,
+  batchCount: number,
+): number | null {
+  if (batchCount <= 0) return null;
+  if (sectionHeight <= 0) return 0;
+  return Math.min(
+    batchCount - 1,
+    Math.max(0, Math.floor((position / sectionHeight) * batchCount)),
+  );
+}

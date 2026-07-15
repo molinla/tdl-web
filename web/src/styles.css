@@ -264,13 +264,8 @@ button {
 
 .cover-loading-label {
   display: flex;
-  flex-direction: column;
   align-items: center;
   justify-content: center;
-  gap: 0.45rem;
-  font-size: 0.72rem;
-  color: var(--muted);
-  text-align: center;
   padding: 0.5rem;
 }
 
@@ -537,13 +532,11 @@ button {
   border-radius: 0;
   overflow: hidden;
   width: 100%;
-  transition: transform 0.2s ease, filter 0.2s ease;
 }
 
 .card:hover,
 .card:focus-visible {
   filter: brightness(1.08);
-  transform: scale(1.02);
 }
 
 .card-cover {
@@ -603,6 +596,11 @@ button {
   will-change: transform, opacity;
 }
 
+.card-overlay-inner {
+  position: relative;
+  z-index: 1;
+}
+
 .card-overlay--hidden {
   transform: translateY(100%);
   opacity: 0;
@@ -641,8 +639,14 @@ button {
 
 .card-status {
   flex-shrink: 0;
+  display: flex;
+  align-items: center;
   color: rgba(255, 255, 255, 0.72);
   font-size: 0.7rem;
+}
+
+.card-cloud-icon {
+  opacity: 0.82;
 }
 
 .badge {

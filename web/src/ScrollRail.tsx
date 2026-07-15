@@ -1,9 +1,10 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   buildRailLayout,
   CATEGORY_LINES_PER_SECTION,
   RAIL_HEIGHT_RATIO,
   RAIL_LINE_GAP,
+  railBatchIndexAtPosition,
   railHeightPx,
   scrollToItem,
   type RailSectionLayout,
@@ -78,25 +79,17 @@ export function ScrollRail({
     [viewportHeight, videos, images, files],
   );
 
-  const itemBatchMap = useMemo(() => {
-    const map = new Map<string, string>();
-    for (const section of sections) {
-      for (const batch of section.batches) {
-        for (const item of batch.items) {
-          map.set(item.id, batch.id);
-        }
-      }
-    }
-    return map;
-  }, [sections]);
-
   const [activeSectionId, setActiveSectionId] = useState<string>(
     SECTION_META[0].id,
   );
-  const [activeItemId, setActiveItemId] = useState<string | null>(null);
-  const activeBatchId = activeItemId
-    ? (itemBatchMap.get(activeItemId) ?? null)
-    : null;
+  const [activeBatchId, setActiveBatchId] = useState<string | null>(null);
+  const activePositionRef = useRef<{
+    sectionId: string;
+    batchIndex: number | null;
+  }>({ sectionId: SECTION_META[0].id, batchIndex: null });
+  const lastScrollYRef = useRef(
+    typeof window === "undefined" ? 0 : window.scrollY,
+  );
 
   const flatLines = useMemo(() => {
     const lines: FlatRailLine[] = [];
@@ -142,73 +135,88 @@ export function ScrollRail({
   }, [sections, activeSectionId, activeBatchId]);
 
   useEffect(() => {
-    const sectionEls = SECTION_META.map((s) => document.getElementById(s.id)).filter(
-      (el): el is HTMLElement => el != null,
-    );
-    if (!sectionEls.length) return;
-
-    const sectionObserver = new IntersectionObserver(
-      (entries) => {
-        const visible = entries
-          .filter((e) => e.isIntersecting)
-          .sort((a, b) => b.intersectionRatio - a.intersectionRatio);
-        if (visible[0]?.target.id) {
-          const nextId = visible[0].target.id;
-          setActiveSectionId((prev) => (prev === nextId ? prev : nextId));
-        }
-      },
-      { rootMargin: "-12% 0px -58% 0px", threshold: [0, 0.15, 0.35, 0.6] },
-    );
-
-    for (const el of sectionEls) sectionObserver.observe(el);
-    return () => sectionObserver.disconnect();
-  }, []);
-
-  useEffect(() => {
     let raf = 0;
-    let lastId: string | null = null;
 
-    function updateActiveItem() {
+    function updateActiveLine() {
       raf = 0;
-      const nodes = document.querySelectorAll<HTMLElement>("[data-scroll-item]");
       const viewportHeight = readViewportHeight();
-      const center = viewportHeight * 0.42;
-      let bestId: string | null = null;
+      const anchor = viewportHeight * 0.42;
+      let selected:
+        | {
+            section: RailSectionLayout;
+            rect: DOMRect;
+          }
+        | undefined;
       let bestDist = Number.POSITIVE_INFINITY;
 
-      nodes.forEach((el) => {
+      for (const section of sections) {
+        const el = document.getElementById(section.id);
+        if (!el) continue;
         const rect = el.getBoundingClientRect();
-        if (rect.bottom < 0 || rect.top > viewportHeight) return;
-        const itemCenter = rect.top + rect.height / 2;
-        const dist = Math.abs(itemCenter - center);
+        const dist =
+          anchor < rect.top
+            ? rect.top - anchor
+            : anchor > rect.bottom
+              ? anchor - rect.bottom
+              : 0;
         if (dist < bestDist) {
           bestDist = dist;
-          bestId = el.dataset.scrollItem ?? null;
+          selected = { section, rect };
         }
-      });
-
-      if (bestId !== lastId) {
-        lastId = bestId;
-        setActiveItemId(bestId);
       }
+      if (!selected) return;
+
+      const { section, rect } = selected;
+      let batchIndex = railBatchIndexAtPosition(
+        anchor - rect.top,
+        rect.height,
+        section.batches.length,
+      );
+      const scrollY = window.scrollY;
+      const scrollDelta = scrollY - lastScrollYRef.current;
+      if (Math.abs(scrollDelta) >= 1) lastScrollYRef.current = scrollY;
+
+      const previous = activePositionRef.current;
+      if (
+        previous.sectionId === section.id &&
+        previous.batchIndex != null &&
+        batchIndex != null
+      ) {
+        const previousIndex = Math.min(
+          previous.batchIndex,
+          section.batches.length - 1,
+        );
+        batchIndex =
+          scrollDelta >= 1
+            ? Math.max(previousIndex, batchIndex)
+            : scrollDelta <= -1
+              ? Math.min(previousIndex, batchIndex)
+              : previousIndex;
+      }
+
+      activePositionRef.current = { sectionId: section.id, batchIndex };
+      const batchId =
+        batchIndex == null ? null : (section.batches[batchIndex]?.id ?? null);
+      setActiveSectionId((prev) => (prev === section.id ? prev : section.id));
+      setActiveBatchId((prev) => (prev === batchId ? prev : batchId));
     }
 
-    function scheduleActiveItemUpdate() {
+    function scheduleActiveLineUpdate() {
       if (raf) return;
-      raf = window.requestAnimationFrame(updateActiveItem);
+      raf = window.requestAnimationFrame(updateActiveLine);
     }
 
-    scheduleActiveItemUpdate();
-    window.addEventListener("scroll", scheduleActiveItemUpdate, {
+    scheduleActiveLineUpdate();
+    window.addEventListener("scroll", scheduleActiveLineUpdate, {
       passive: true,
     });
-    window.addEventListener("resize", scheduleActiveItemUpdate);
+    window.addEventListener("resize", scheduleActiveLineUpdate);
     return () => {
       if (raf) window.cancelAnimationFrame(raf);
-      window.removeEventListener("scroll", scheduleActiveItemUpdate);
-      window.removeEventListener("resize", scheduleActiveItemUpdate);
+      window.removeEventListener("scroll", scheduleActiveLineUpdate);
+      window.removeEventListener("resize", scheduleActiveLineUpdate);
     };
-  }, [videos, images, files]);
+  }, [sections]);
 
   const railStyle = {
     height: `${railHeightPx(viewportHeight)}px`,
