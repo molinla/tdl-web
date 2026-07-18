@@ -147,7 +147,7 @@ func (s *Server) importSources(ctx context.Context, files, urls []string, rangeT
 
 func (s *Server) importFromJSONFiles(ctx context.Context, files []string, rangeType string, rangeFrom, rangeTo int) error {
 	s.setImportPhase(phaseParseJSON, sourceJSON, "读取 JSON 导出")
-	rich, err := tmessage.FromFileRich(ctx, s.pool, s.kvd, files, true)
+	rich, err := tmessage.FromFileRich(ctx, s.pool, s.kvd, files, false)
 	if err != nil {
 		return err
 	}
@@ -238,31 +238,48 @@ func (s *Server) importFromJSONFiles(ctx context.Context, files []string, rangeT
 				s.bumpImportDone()
 				continue
 			}
-			rel, err := renderNameFromMeta(tpl, from.ID(), meta)
-			if err != nil {
-				return err
-			}
-			targetPath := joinPath(s.opts.Dir, rel)
 			id := stableIDFromMeta(fingerprint, from.ID(), meta.ID, logical, meta)
 			kind := meta.Kind
 			if kind == "" {
 				kind = mediaType(meta.FileName, meta.MIME)
 			}
+			name := fmt.Sprintf("消息 %d", meta.ID)
+			targetPath := ""
+			if kind != mediaMessage {
+				rel, err := renderNameFromMeta(tpl, from.ID(), meta)
+				if err != nil {
+					return err
+				}
+				name = baseName(rel)
+				targetPath = joinPath(s.opts.Dir, rel)
+			}
 			item := &Item{
-				ID:          id,
-				PeerID:      from.ID(),
-				MessageID:   meta.ID,
-				LogicalPos:  logical,
-				Name:        baseName(rel),
-				MIME:        meta.MIME,
-				Type:        kind,
-				Size:        meta.Size,
-				Duration:    meta.Duration,
-				Date:        meta.Date,
-				Status:      statusQueued,
-				TargetPath:  targetPath,
-				CoverAspect: aspectFromSize(meta.Width, meta.Height),
-				DownloadURL: "/api/items/" + id + "/download",
+				ID:            id,
+				PeerID:        from.ID(),
+				MessageID:     meta.ID,
+				LogicalPos:    logical,
+				Name:          name,
+				MIME:          meta.MIME,
+				Type:          kind,
+				Size:          meta.Size,
+				Duration:      meta.Duration,
+				Date:          meta.Date,
+				MessageKind:   meta.MessageKind,
+				Text:          meta.Caption,
+				Author:        meta.Author,
+				ForwardedFrom: meta.ForwardedFrom,
+				SavedFrom:     meta.SavedFrom,
+				Status:        statusCompleted,
+				TargetPath:    targetPath,
+				CoverAspect:   aspectFromSize(meta.Width, meta.Height),
+				autoDownload:  kind != mediaMessage,
+			}
+			if item.MessageKind == "" {
+				item.MessageKind = "message"
+			}
+			if kind != mediaMessage {
+				item.Status = statusQueued
+				item.DownloadURL = "/api/items/" + id + "/download"
 			}
 			switch item.Type {
 			case mediaVideo:
@@ -275,22 +292,24 @@ func (s *Server) importFromJSONFiles(ctx context.Context, files []string, rangeT
 				item.PreviewURL = "/api/items/" + id + "/preview"
 			}
 
-			s.mu.RLock()
-			_, resumeOK := s.finished[logical]
-			s.mu.RUnlock()
-			if resumeOK {
-				item.Status = statusCompleted
-				item.Progress = item.Size
-				item.ResumeCompleted = true
-			} else if s.opts.SkipSame && sameFileExists(targetPath, item.Size) {
-				item.Status = statusCompleted
-				item.Progress = item.Size
-				item.SkipSame = true
-				s.mu.Lock()
-				s.finished[logical] = struct{}{}
-				s.mu.Unlock()
-			} else {
-				applyDiskProgress(item)
+			if item.Type != mediaMessage {
+				s.mu.RLock()
+				_, resumeOK := s.finished[logical]
+				s.mu.RUnlock()
+				if resumeOK {
+					item.Status = statusCompleted
+					item.Progress = item.Size
+					item.ResumeCompleted = true
+				} else if s.opts.SkipSame && sameFileExists(targetPath, item.Size) {
+					item.Status = statusCompleted
+					item.Progress = item.Size
+					item.SkipSame = true
+					s.mu.Lock()
+					s.finished[logical] = struct{}{}
+					s.mu.Unlock()
+				} else {
+					applyDiskProgress(item)
+				}
 			}
 
 			s.appendItem(item)
@@ -392,6 +411,8 @@ func (s *Server) importFromURLs(ctx context.Context, urls []string, rangeType st
 				Size:        main.Size,
 				Duration:    duration,
 				Date:        int64(msg.Date),
+				MessageKind: "message",
+				Text:        msg.Message,
 				Status:      statusQueued,
 				TargetPath:  targetPath,
 				CoverAspect: coverAspect(main, thumb),
@@ -477,7 +498,11 @@ func (s *Server) applyCachedItems(ctx context.Context, cached []*Item) error {
 
 	for _, item := range cached {
 		logical := item.LogicalPos
-		if _, resumeOK := finished[logical]; resumeOK {
+		if item.Type == mediaMessage {
+			item.Status = statusCompleted
+			item.Progress = 0
+			item.Error = ""
+		} else if _, resumeOK := finished[logical]; resumeOK {
 			item.Status = statusCompleted
 			item.Progress = item.Size
 			item.Error = ""
@@ -500,6 +525,12 @@ func (s *Server) applyCachedItems(ctx context.Context, cached []*Item) error {
 	s.mu.Lock()
 	s.items = items
 	s.order = order
+	s.chatOrder = map[string][]string{}
+	s.chatCursor = map[string]int{}
+	s.chatDone = map[string]bool{}
+	s.savedSources = nil
+	s.savedLoaded = false
+	s.takeoutChats = map[string]*takeoutChatState{}
 	s.finished = finished
 	s.importTotal = total
 	s.importDone = total
@@ -522,7 +553,7 @@ func (s *Server) resumePausedIfContinue(ctx context.Context) {
 	s.mu.RLock()
 	for _, id := range s.order {
 		it := s.items[id]
-		if it == nil || it.Status == statusCompleted || it.Status == statusError {
+		if it == nil || !it.autoDownload || it.Status == statusCompleted || it.Status == statusError {
 			continue
 		}
 		if it.ManualPaused {
@@ -546,7 +577,7 @@ func (s *Server) enqueueVideoDownloads(ctx context.Context) {
 	s.mu.RLock()
 	for _, id := range s.order {
 		it := s.items[id]
-		if it == nil || it.Type != mediaVideo || it.Status == statusCompleted || it.Status == statusError || it.ManualPaused {
+		if it == nil || !it.autoDownload || it.Type != mediaVideo || it.Status == statusCompleted || it.Status == statusError || it.ManualPaused {
 			continue
 		}
 		ids = append(ids, id)
@@ -561,6 +592,12 @@ func (s *Server) resetImportState(fingerprint string, finished map[int]struct{},
 	s.mu.Lock()
 	s.items = map[string]*Item{}
 	s.order = make([]string, 0, total)
+	s.chatOrder = map[string][]string{}
+	s.chatCursor = map[string]int{}
+	s.chatDone = map[string]bool{}
+	s.savedSources = nil
+	s.savedLoaded = false
+	s.takeoutChats = map[string]*takeoutChatState{}
 	s.fingerprint = fingerprint
 	s.finished = finished
 	s.downloading = map[string]struct{}{}
@@ -617,8 +654,13 @@ func (s *Server) saveFinishedOrClear(ctx context.Context) error {
 	for k, v := range s.finished {
 		finished[k] = v
 	}
-	allDone := len(s.items) > 0
-	for _, it := range s.items {
+	allDone := len(s.order) > 0
+	for _, id := range s.order {
+		it := s.items[id]
+		if it == nil {
+			allDone = false
+			break
+		}
 		if it.Status != statusCompleted && it.Status != statusSkipped {
 			allDone = false
 			break

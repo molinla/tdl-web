@@ -19,6 +19,7 @@ type Options struct {
 	NTP              string
 	ReconnectTimeout time.Duration
 	UpdateHandler    telegram.UpdateHandler
+	DeviceModel      string
 }
 
 func GetApp(kv storage.Storage) (App, error) {
@@ -35,6 +36,10 @@ func GetApp(kv storage.Storage) (App, error) {
 }
 
 func New(ctx context.Context, o Options, login bool, middlewares ...telegram.Middleware) (*telegram.Client, error) {
+	return NewWithSession(ctx, o, storage.NewSession(o.KV, login), middlewares...)
+}
+
+func NewWithSession(ctx context.Context, o Options, session telegram.SessionStorage, middlewares ...telegram.Middleware) (*telegram.Client, error) {
 	app, err := GetApp(o.KV)
 	if err != nil {
 		return nil, errors.Wrap(err, "get app")
@@ -43,11 +48,12 @@ func New(ctx context.Context, o Options, login bool, middlewares ...telegram.Mid
 	return tclient.New(ctx, tclient.Options{
 		AppID:            app.AppID,
 		AppHash:          app.AppHash,
-		Session:          storage.NewSession(o.KV, login),
+		Session:          session,
 		Middlewares:      middlewares,
 		Proxy:            o.Proxy,
 		NTP:              o.NTP,
 		ReconnectTimeout: o.ReconnectTimeout,
 		UpdateHandler:    o.UpdateHandler,
+		DeviceModel:      o.DeviceModel,
 	})
 }

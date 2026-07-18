@@ -3,6 +3,7 @@ package web
 import (
 	"context"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gotd/td/tg"
@@ -22,6 +23,7 @@ const (
 	mediaVideo       = "video"
 	mediaImage       = "image"
 	mediaFile        = "file"
+	mediaMessage     = "message"
 	defaultCachePerm = 0o755
 	tempExt          = ".tmp"
 	downloadPartSize = 1024 * 1024
@@ -56,33 +58,43 @@ type Options struct {
 }
 
 type Item struct {
-	ID              string  `json:"id"`
-	PeerID          int64   `json:"peer_id"`
-	MessageID       int     `json:"message_id"`
-	LogicalPos      int     `json:"logical_pos"`
-	Name            string  `json:"name"`
-	MIME            string  `json:"mime"`
-	Type            string  `json:"type"`
-	Size            int64   `json:"size"`
-	Duration        int     `json:"duration,omitempty"`
-	Date            int64   `json:"date,omitempty"` // message unix seconds
-	Status          string  `json:"status"`
-	Progress        int64   `json:"progress"`
-	Error           string  `json:"error,omitempty"`
-	TargetPath      string  `json:"target_path"`
-	ThumbURL        string  `json:"thumb_url,omitempty"`
-	CoverURL        string  `json:"cover,omitempty"`
-	CoverAspect     float64 `json:"cover_aspect,omitempty"` // height / width
-	PreviewURL      string  `json:"preview_url,omitempty"`
-	StreamURL       string  `json:"stream_url,omitempty"`
-	DownloadURL     string  `json:"download_url"`
-	ResumeCompleted bool    `json:"resume_completed"`
-	SkipSame        bool    `json:"skip_same"`
-	QueuePos        int     `json:"queue_pos,omitempty"` // 1-based wait queue; 0 if not waiting
-	ManualPaused    bool    `json:"manual_paused,omitempty"`
+	ID               string  `json:"id"`
+	ChatID           string  `json:"chat_id,omitempty"`
+	PeerID           int64   `json:"peer_id"`
+	MessageID        int     `json:"message_id"`
+	LogicalPos       int     `json:"logical_pos"`
+	Name             string  `json:"name"`
+	MIME             string  `json:"mime"`
+	Type             string  `json:"type"`
+	Size             int64   `json:"size"`
+	Duration         int     `json:"duration,omitempty"`
+	Date             int64   `json:"date,omitempty"` // message unix seconds
+	MessageKind      string  `json:"message_kind,omitempty"`
+	Text             string  `json:"text,omitempty"`
+	Author           string  `json:"author,omitempty"`
+	ForwardedFrom    string  `json:"forwarded_from,omitempty"`
+	SavedFrom        string  `json:"saved_from,omitempty"`
+	MediaUnavailable string  `json:"media_unavailable,omitempty"`
+	Status           string  `json:"status"`
+	Progress         int64   `json:"progress"`
+	Error            string  `json:"error,omitempty"`
+	TargetPath       string  `json:"target_path"`
+	ThumbURL         string  `json:"thumb_url,omitempty"`
+	CoverURL         string  `json:"cover,omitempty"`
+	CoverAspect      float64 `json:"cover_aspect,omitempty"` // height / width
+	PreviewURL       string  `json:"preview_url,omitempty"`
+	StreamURL        string  `json:"stream_url,omitempty"`
+	DownloadURL      string  `json:"download_url,omitempty"`
+	ResumeCompleted  bool    `json:"resume_completed"`
+	SkipSame         bool    `json:"skip_same"`
+	QueuePos         int     `json:"queue_pos,omitempty"` // 1-based wait queue; 0 if not waiting
+	ManualPaused     bool    `json:"manual_paused,omitempty"`
 
-	media *media
-	thumb *media
+	media     *media
+	thumb     *media
+	savedPeer tg.InputPeerClass
+	// Only local JSON imports may enter automatic download/resume queues.
+	autoDownload bool
 }
 
 type media struct {
@@ -121,6 +133,17 @@ type Server struct {
 	importPhase  string
 	importSource string
 	importDetail string
+	activeChat   string
+	activeTitle  string
+	chatList     []ChatInfo
+	chatPeers    map[string]tg.InputPeerClass
+	chatOrder    map[string][]string
+	chatCursor   map[string]int
+	chatDone     map[string]bool
+	savedSources []*savedChatSource
+	savedLoaded  bool
+	takeoutChats map[string]*takeoutChatState
+	selfID       int64
 
 	// Global download scheduler (shared -l/--limit).
 	// Priority queue (play) gets a reserved slot; background may borrow it when idle.
@@ -160,4 +183,6 @@ type Server struct {
 
 	events chan struct{}
 	jelly  *jellyfinClient
+
+	progressVersion atomic.Uint64
 }

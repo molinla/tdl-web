@@ -432,11 +432,12 @@ func TestEnqueueVideoDownloadsOnlyQueuesEligibleVideos(t *testing.T) {
 		events:      make(chan struct{}, 1),
 	}
 	for i, it := range []*Item{
-		{ID: "v1", Type: mediaVideo, Status: statusQueued},
-		{ID: "img", Type: mediaImage, Status: statusQueued},
-		{ID: "done", Type: mediaVideo, Status: statusCompleted},
-		{ID: "manual", Type: mediaVideo, Status: statusPaused, ManualPaused: true},
-		{ID: "v2", Type: mediaVideo, Status: statusQueued},
+		{ID: "v1", Type: mediaVideo, Status: statusQueued, autoDownload: true},
+		{ID: "img", Type: mediaImage, Status: statusQueued, autoDownload: true},
+		{ID: "done", Type: mediaVideo, Status: statusCompleted, autoDownload: true},
+		{ID: "manual", Type: mediaVideo, Status: statusPaused, ManualPaused: true, autoDownload: true},
+		{ID: "remote", Type: mediaVideo, Status: statusQueued},
+		{ID: "v2", Type: mediaVideo, Status: statusQueued, autoDownload: true},
 	} {
 		it.LogicalPos = i
 		it.Size = 1
@@ -455,7 +456,7 @@ func TestEnqueueVideoDownloadsOnlyQueuesEligibleVideos(t *testing.T) {
 			t.Fatalf("timeout waiting for eligible videos; seen=%v", seen)
 		}
 	}
-	if !seen["v1"] || !seen["v2"] || seen["img"] || seen["done"] || seen["manual"] {
+	if !seen["v1"] || !seen["v2"] || seen["img"] || seen["done"] || seen["manual"] || seen["remote"] {
 		t.Fatalf("queued wrong items: %v", seen)
 	}
 	close(gate)

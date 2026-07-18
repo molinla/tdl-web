@@ -11,6 +11,8 @@ import (
 	"github.com/go-faster/errors"
 	"github.com/gorilla/mux"
 	"github.com/gotd/td/telegram"
+	"github.com/gotd/td/telegram/auth/qrlogin"
+	"github.com/gotd/td/tg"
 	"github.com/spf13/viper"
 	"go.uber.org/multierr"
 
@@ -20,7 +22,7 @@ import (
 	"github.com/iyear/tdl/pkg/consts"
 )
 
-func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options) (rerr error) {
+func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Options, loggedIn qrlogin.LoggedIn, updates tg.UpdateDispatcher, canSwitchBack bool) (rerr error) {
 	if opts.Addr == "" {
 		opts.Addr = "127.0.0.1:8080"
 	}
@@ -65,15 +67,33 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 		events:       make(chan struct{}, 1),
 		importPhase:  phaseIdle,
 		importSource: sourceIdle,
+		chatPeers:    map[string]tg.InputPeerClass{},
+		chatOrder:    map[string][]string{},
+		chatCursor:   map[string]int{},
+		chatDone:     map[string]bool{},
 	}
+	updates.OnNewMessage(s.handleNewMessage)
+	updates.OnNewChannelMessage(s.handleNewChannelMessage)
 	if opts.JellyfinRefresh && opts.JellyfinURL != "" && opts.JellyfinAPIKey != "" {
 		s.jelly = newJellyfinClient(opts.JellyfinURL, opts.JellyfinAPIKey)
 	}
 
+	restart := make(chan struct{})
+	auth := newWebAuth(ctx, c, loggedIn, restart, canSwitchBack)
+	auth.check(ctx)
+
 	router := mux.NewRouter()
 	router.Use(corsMiddleware)
 	api := router.PathPrefix("/api").Subrouter()
-	api.Use(s.authMiddleware)
+	api.Use(s.authMiddleware, auth.middleware)
+	api.HandleFunc("/auth/status", auth.handleStatus).Methods(http.MethodGet, http.MethodOptions)
+	api.HandleFunc("/auth/qr", auth.handleStart).Methods(http.MethodPost, http.MethodOptions)
+	api.HandleFunc("/auth/qr.png", auth.handleQR).Methods(http.MethodGet, http.MethodHead, http.MethodOptions)
+	api.HandleFunc("/auth/password", auth.handlePassword).Methods(http.MethodPost, http.MethodOptions)
+	api.HandleFunc("/auth/switch", auth.handleSwitch).Methods(http.MethodPost, http.MethodOptions)
+	api.HandleFunc("/chats", s.handleChats(ctx, c)).Methods(http.MethodGet, http.MethodOptions)
+	api.HandleFunc("/chats/select", s.handleSelectChat(ctx, c)).Methods(http.MethodPost, http.MethodOptions)
+	api.HandleFunc("/chats/more", s.handleMoreChat(ctx)).Methods(http.MethodPost, http.MethodOptions)
 	api.HandleFunc("/import", s.handleImport(ctx)).Methods(http.MethodPost, http.MethodOptions)
 	api.HandleFunc("/items", s.handleItems).Methods(http.MethodGet, http.MethodOptions)
 	api.HandleFunc("/items/download", s.handleDownload(ctx)).Methods(http.MethodPost, http.MethodOptions)
@@ -91,7 +111,10 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 
 	httpServer := &http.Server{Addr: opts.Addr, Handler: router}
 	go func() {
-		<-ctx.Done()
+		select {
+		case <-ctx.Done():
+		case <-restart:
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 		_ = httpServer.Shutdown(shutdownCtx)
@@ -101,6 +124,9 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 	color.Cyan("Open the separate web/ frontend (npm run dev) and point it at this API")
 	if len(opts.Files) > 0 || len(opts.URLs) > 0 {
 		go func() {
+			if err := auth.wait(ctx); err != nil {
+				return
+			}
 			s.setImporting(true, "")
 			if len(opts.Files) > 0 {
 				s.setImportPhase(phaseParseJSON, sourceJSON, "读取 JSON 导出")
@@ -114,7 +140,19 @@ func Run(ctx context.Context, c *telegram.Client, kvd storage.Storage, opts Opti
 			s.setImporting(false, "")
 		}()
 	}
-	return httpServer.ListenAndServe()
+	err := httpServer.ListenAndServe()
+	if errors.Is(err, http.ErrServerClosed) {
+		select {
+		case <-restart:
+			return &AccountSwitchError{
+				Previous:       auth.switchToPrevious(),
+				DiscardCurrent: auth.discardCurrentOnSwitch(),
+			}
+		default:
+			return nil
+		}
+	}
+	return err
 }
 
 func corsMiddleware(next http.Handler) http.Handler {

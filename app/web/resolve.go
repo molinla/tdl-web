@@ -6,6 +6,7 @@ import (
 
 	"github.com/go-faster/errors"
 	"github.com/gotd/td/telegram/peers"
+	"github.com/gotd/td/tg"
 
 	"github.com/iyear/tdl/core/storage"
 	"github.com/iyear/tdl/core/util/tutil"
@@ -29,18 +30,33 @@ func (s *Server) ensureMedia(ctx context.Context, id string) (*Item, error) {
 		return cp, nil
 	}
 	peerID, msgID := item.PeerID, item.MessageID
+	chatPeer := s.chatPeers[item.ChatID]
 	s.mu.RUnlock()
 
-	manager := peers.Options{Storage: storage.NewPeers(s.kvd)}.Build(s.pool.Default(ctx))
-	from, err := tutil.GetInputPeer(ctx, manager, strconv.FormatInt(peerID, 10))
-	if err != nil {
-		return nil, errors.Wrap(err, "resolve peer")
+	var inputPeer tg.InputPeerClass
+	if chatPeer != nil {
+		inputPeer = chatPeer
+	} else {
+		manager := peers.Options{Storage: storage.NewPeers(s.kvd)}.Build(s.pool.Default(ctx))
+		from, err := tutil.GetInputPeer(ctx, manager, strconv.FormatInt(peerID, 10))
+		if err != nil {
+			return nil, errors.Wrap(err, "resolve peer")
+		}
+		inputPeer = from.InputPeer()
 	}
 	msgClient := s.pool.Default(ctx)
 	if s.opts.Takeout {
 		msgClient = s.pool.DefaultTakeout(ctx)
 	}
-	msg, err := tutil.GetSingleMessage(ctx, msgClient, from.InputPeer(), msgID)
+	var (
+		msg *tg.Message
+		err error
+	)
+	if item.ChatID == chatSaved && item.savedPeer != nil {
+		msg, err = getSavedMessage(ctx, msgClient, item.savedPeer, msgID)
+	} else {
+		msg, err = tutil.GetSingleMessage(ctx, msgClient, inputPeer, msgID)
+	}
 	if err != nil {
 		return nil, errors.Wrap(err, "get message")
 	}

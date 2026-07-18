@@ -22,16 +22,20 @@ import (
 // MediaInfo is metadata extracted from Telegram Desktop / tdl export JSON.
 // Enough to render a gallery without calling GetSingleMessage.
 type MediaInfo struct {
-	ID       int
-	Date     int64
-	FileName string
-	Size     int64
-	MIME     string
-	Duration int
-	Width    int
-	Height   int
-	Kind     string // video | image | file
-	Caption  string
+	ID            int
+	Date          int64
+	FileName      string
+	Size          int64
+	MIME          string
+	Duration      int
+	Width         int
+	Height        int
+	Kind          string // video | image | file | message
+	MessageKind   string
+	Caption       string
+	Author        string
+	ForwardedFrom string
+	SavedFrom     string
 }
 
 type RichDialog struct {
@@ -54,6 +58,10 @@ type richMessage struct {
 	Width           int         `mapstructure:"width"`
 	Height          int         `mapstructure:"height"`
 	Text            interface{} `mapstructure:"text"`
+	From            string      `mapstructure:"from"`
+	ForwardedFrom   string      `mapstructure:"forwarded_from"`
+	SavedFrom       string      `mapstructure:"saved_from"`
+	Action          string      `mapstructure:"action"`
 }
 
 // FromFileRich parses export JSON into rich media rows (no per-message Telegram fetch).
@@ -110,7 +118,7 @@ func collectRich(ctx context.Context, r io.Reader, peer peers.Peer, onlyMedia bo
 		if err := mapstructure.WeakDecode(mv.Value, &fm); err != nil {
 			return nil, err
 		}
-		if fm.ID < 0 || fm.Type != typeMessage {
+		if fm.ID < 0 || fm.Type == "" {
 			continue
 		}
 		hasFile := fm.File != "" || fm.FileName != ""
@@ -120,24 +128,35 @@ func collectRich(ctx context.Context, r io.Reader, peer peers.Peer, onlyMedia bo
 		}
 
 		info := MediaInfo{
-			ID:       fm.ID,
-			FileName: pickFileName(fm),
-			Size:     fm.FileSize,
-			MIME:     fm.MimeType,
-			Duration: fm.DurationSeconds,
-			Width:    fm.Width,
-			Height:   fm.Height,
-			Caption:  textAsString(fm.Text),
+			ID:            fm.ID,
+			Size:          fm.FileSize,
+			MIME:          fm.MimeType,
+			Duration:      fm.DurationSeconds,
+			Width:         fm.Width,
+			Height:        fm.Height,
+			MessageKind:   fm.Type,
+			Caption:       textAsString(fm.Text),
+			Author:        fm.From,
+			ForwardedFrom: fm.ForwardedFrom,
+			SavedFrom:     fm.SavedFrom,
+		}
+		if info.Caption == "" && fm.Type != typeMessage {
+			info.Caption = fm.Action
 		}
 		if fm.Time != "" {
 			if ts, err := strconv.ParseInt(fm.Time, 10, 64); err == nil {
 				info.Date = ts
 			}
 		}
-		if info.MIME == "" && hasPhoto {
-			info.MIME = "image/jpeg"
+		if hasFile || hasPhoto {
+			info.FileName = pickFileName(fm)
+			if info.MIME == "" && hasPhoto {
+				info.MIME = "image/jpeg"
+			}
+			info.Kind = classifyKind(fm.MediaType, info.MIME, info.FileName, hasPhoto)
+		} else {
+			info.Kind = "message"
 		}
-		info.Kind = classifyKind(fm.MediaType, info.MIME, info.FileName, hasPhoto)
 		out.Messages = append(out.Messages, info)
 	}
 	return out, nil
@@ -196,6 +215,14 @@ func textAsString(v interface{}) string {
 	switch t := v.(type) {
 	case string:
 		return t
+	case []interface{}:
+		var b strings.Builder
+		for _, part := range t {
+			b.WriteString(textAsString(part))
+		}
+		return b.String()
+	case map[string]interface{}:
+		return textAsString(t["text"])
 	case nil:
 		return ""
 	default:

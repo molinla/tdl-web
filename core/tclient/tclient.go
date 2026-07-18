@@ -38,6 +38,7 @@ type Options struct {
 	NTP              string
 	ReconnectTimeout time.Duration
 	UpdateHandler    telegram.UpdateHandler
+	DeviceModel      string
 }
 
 // New creates new telegram client with given options.
@@ -63,6 +64,11 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		dialer = d.DialContext
 	}
 
+	device := tutil.Device
+	if o.DeviceModel != "" {
+		device.DeviceModel = o.DeviceModel
+	}
+
 	opts := telegram.Options{
 		Resolver: dcs.Plain(dcs.PlainOptions{
 			Dial: dialer,
@@ -74,7 +80,7 @@ func New(ctx context.Context, o Options) (*telegram.Client, error) {
 		DCList:         DCList,
 		PublicKeys:     PublicKeys,
 		UpdateHandler:  o.UpdateHandler,
-		Device:         tutil.Device,
+		Device:         device,
 		SessionStorage: o.Session,
 		RetryInterval:  5 * time.Second,
 		MaxRetries:     5,

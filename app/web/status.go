@@ -34,7 +34,7 @@ func (s *Server) downloadActivityCounts() (downloading, queued int) {
 	queuePos := s.queuePositions()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
-	for _, id := range s.order {
+	for _, id := range s.visibleOrderLocked() {
 		it := s.items[id]
 		if it == nil {
 			continue

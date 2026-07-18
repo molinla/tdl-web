@@ -10,7 +10,7 @@ import (
 	"github.com/iyear/tdl/core/logctx"
 )
 
-const metaCacheVersion = 5
+const metaCacheVersion = 6
 
 type metaCacheFile struct {
 	Version       int             `json:"version"`
@@ -21,22 +21,28 @@ type metaCacheFile struct {
 }
 
 type metaCacheItem struct {
-	ID           string  `json:"id"`
-	PeerID       int64   `json:"peer_id"`
-	MessageID    int     `json:"message_id"`
-	LogicalPos   int     `json:"logical_pos"`
-	RelPath      string  `json:"rel_path"`
-	Name         string  `json:"name"`
-	MIME         string  `json:"mime"`
-	Type         string  `json:"type"`
-	Size         int64   `json:"size"`
-	Duration     int     `json:"duration,omitempty"`
-	CoverAspect  float64 `json:"cover_aspect,omitempty"`
-	Date         int64   `json:"date,omitempty"`
-	Status       string  `json:"status,omitempty"`
-	Error        string  `json:"error,omitempty"`
-	Progress     int64   `json:"progress,omitempty"`
-	ManualPaused bool    `json:"manual_paused,omitempty"`
+	ID               string  `json:"id"`
+	PeerID           int64   `json:"peer_id"`
+	MessageID        int     `json:"message_id"`
+	LogicalPos       int     `json:"logical_pos"`
+	RelPath          string  `json:"rel_path"`
+	Name             string  `json:"name"`
+	MIME             string  `json:"mime"`
+	Type             string  `json:"type"`
+	Size             int64   `json:"size"`
+	Duration         int     `json:"duration,omitempty"`
+	CoverAspect      float64 `json:"cover_aspect,omitempty"`
+	Date             int64   `json:"date,omitempty"`
+	MessageKind      string  `json:"message_kind,omitempty"`
+	Text             string  `json:"text,omitempty"`
+	Author           string  `json:"author,omitempty"`
+	ForwardedFrom    string  `json:"forwarded_from,omitempty"`
+	SavedFrom        string  `json:"saved_from,omitempty"`
+	MediaUnavailable string  `json:"media_unavailable,omitempty"`
+	Status           string  `json:"status,omitempty"`
+	Error            string  `json:"error,omitempty"`
+	Progress         int64   `json:"progress,omitempty"`
+	ManualPaused     bool    `json:"manual_paused,omitempty"`
 	// Do not cache Telegram InputFileLocation here; its file_reference expires.
 }
 
@@ -76,27 +82,36 @@ func (s *Server) saveMetaCache() error {
 		if it == nil {
 			continue
 		}
-		rel := it.Name
-		if r, err := filepath.Rel(s.opts.Dir, it.TargetPath); err == nil {
-			rel = r
+		rel := ""
+		if it.TargetPath != "" {
+			rel = it.Name
+			if r, err := filepath.Rel(s.opts.Dir, it.TargetPath); err == nil {
+				rel = r
+			}
 		}
 		out.Items = append(out.Items, metaCacheItem{
-			ID:           it.ID,
-			PeerID:       it.PeerID,
-			MessageID:    it.MessageID,
-			LogicalPos:   it.LogicalPos,
-			RelPath:      rel,
-			Name:         it.Name,
-			MIME:         it.MIME,
-			Type:         it.Type,
-			Size:         it.Size,
-			Duration:     it.Duration,
-			CoverAspect:  it.CoverAspect,
-			Date:         it.Date,
-			Status:       it.Status,
-			Error:        it.Error,
-			Progress:     it.Progress,
-			ManualPaused: it.ManualPaused,
+			ID:               it.ID,
+			PeerID:           it.PeerID,
+			MessageID:        it.MessageID,
+			LogicalPos:       it.LogicalPos,
+			RelPath:          rel,
+			Name:             it.Name,
+			MIME:             it.MIME,
+			Type:             it.Type,
+			Size:             it.Size,
+			Duration:         it.Duration,
+			CoverAspect:      it.CoverAspect,
+			Date:             it.Date,
+			MessageKind:      it.MessageKind,
+			Text:             it.Text,
+			Author:           it.Author,
+			ForwardedFrom:    it.ForwardedFrom,
+			SavedFrom:        it.SavedFrom,
+			MediaUnavailable: it.MediaUnavailable,
+			Status:           it.Status,
+			Error:            it.Error,
+			Progress:         it.Progress,
+			ManualPaused:     it.ManualPaused,
 		})
 	}
 	s.mu.RUnlock()
@@ -162,27 +177,42 @@ func (s *Server) loadMetaCache(fingerprint string, expectedTotal int) ([]*Item, 
 		if rel == "" {
 			rel = c.Name
 		}
+		targetPath := ""
+		if c.Type != mediaMessage && rel != "" {
+			targetPath = filepath.Join(s.opts.Dir, rel)
+		}
 		item := &Item{
-			ID:           c.ID,
-			PeerID:       c.PeerID,
-			MessageID:    c.MessageID,
-			LogicalPos:   c.LogicalPos,
-			Name:         c.Name,
-			MIME:         c.MIME,
-			Type:         c.Type,
-			Size:         c.Size,
-			Duration:     c.Duration,
-			CoverAspect:  c.CoverAspect,
-			Date:         c.Date,
-			Status:       statusQueued,
-			Error:        c.Error,
-			Progress:     c.Progress,
-			ManualPaused: c.ManualPaused,
-			TargetPath:   filepath.Join(s.opts.Dir, rel),
-			DownloadURL:  "/api/items/" + c.ID + "/download",
+			ID:               c.ID,
+			PeerID:           c.PeerID,
+			MessageID:        c.MessageID,
+			LogicalPos:       c.LogicalPos,
+			Name:             c.Name,
+			MIME:             c.MIME,
+			Type:             c.Type,
+			Size:             c.Size,
+			Duration:         c.Duration,
+			CoverAspect:      c.CoverAspect,
+			Date:             c.Date,
+			MessageKind:      c.MessageKind,
+			Text:             c.Text,
+			Author:           c.Author,
+			ForwardedFrom:    c.ForwardedFrom,
+			SavedFrom:        c.SavedFrom,
+			MediaUnavailable: c.MediaUnavailable,
+			Status:           statusQueued,
+			Error:            c.Error,
+			Progress:         c.Progress,
+			ManualPaused:     c.ManualPaused,
+			TargetPath:       targetPath,
+			autoDownload:     c.Type != mediaMessage,
+		}
+		if item.Type != mediaMessage {
+			item.DownloadURL = "/api/items/" + c.ID + "/download"
 		}
 		// Restore permanent failure so --continue / auto image queue won't retry forever.
-		if c.Status == statusError {
+		if item.Type == mediaMessage {
+			item.Status = statusCompleted
+		} else if c.Status == statusError {
 			item.Status = statusError
 		} else if c.Status == statusPaused {
 			item.Status = statusPaused

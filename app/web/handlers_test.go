@@ -31,6 +31,25 @@ func newHandlerTestServer(t *testing.T) *Server {
 	}
 }
 
+func TestProgressUsesDeltaWithoutFullSnapshotSignal(t *testing.T) {
+	s := newHandlerTestServer(t)
+	s.items["video"] = &Item{ID: "video", Status: statusCaching, Size: 100}
+	s.downloading["video"] = struct{}{}
+
+	s.setProgress("video", 25)
+
+	if len(s.events) != 0 {
+		t.Fatal("progress update queued a full snapshot")
+	}
+	if s.progressVersion.Load() != 1 {
+		t.Fatalf("progress version=%d, want 1", s.progressVersion.Load())
+	}
+	progress := s.progressSnapshot()
+	if len(progress) != 1 || progress[0].ID != "video" || progress[0].Progress != 25 {
+		t.Fatalf("unexpected progress snapshot: %+v", progress)
+	}
+}
+
 func writeTestJPEG(t *testing.T, path string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), defaultCachePerm); err != nil {

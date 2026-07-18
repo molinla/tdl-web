@@ -589,3 +589,8 @@ func fetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialo
 
 	return allElems, skipped
 }
+
+// FetchDialogsWithErrorHandling exposes the resilient dialog iterator to the web UI.
+func FetchDialogsWithErrorHandling(ctx context.Context, api *tg.Client) ([]dialogs.Elem, int) {
+	return fetchDialogsWithErrorHandling(ctx, api)
+}

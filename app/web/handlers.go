@@ -38,6 +38,8 @@ func (s *Server) snapshot() map[string]any {
 	coverBuilding, coverQueued := s.coverActivityCounts()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
+	visible := s.visibleOrderLocked()
+	chatHasMore := s.activeChat != "" && !s.chatDone[s.activeChat]
 	return map[string]any{
 		"fingerprint":          s.fingerprint,
 		"items":                s.itemListLocked(queuePos),
@@ -45,10 +47,13 @@ func (s *Server) snapshot() map[string]any {
 		"import_error":         s.importError,
 		"import_total":         s.importTotal,
 		"import_done":          s.importDone,
-		"import_items":         len(s.order),
+		"import_items":         len(visible),
 		"import_phase":         s.importPhase,
 		"import_source":        s.importSource,
 		"import_detail":        s.importDetail,
+		"active_chat":          s.activeChat,
+		"active_chat_title":    s.activeTitle,
+		"chat_has_more":        chatHasMore,
 		"downloading_count":    downloading,
 		"queued_count":         queued,
 		"cover_building_count": coverBuilding,
@@ -79,8 +84,9 @@ func (s *Server) queuePositions() map[string]int {
 }
 
 func (s *Server) itemListLocked(queuePos map[string]int) []*Item {
-	ret := make([]*Item, 0, len(s.order))
-	for _, id := range s.order {
+	order := s.visibleOrderLocked()
+	ret := make([]*Item, 0, len(order))
+	for _, id := range order {
 		if it := s.items[id]; it != nil {
 			cp := *it
 			cp.media = nil
@@ -95,6 +101,19 @@ func (s *Server) itemListLocked(queuePos map[string]int) []*Item {
 		}
 	}
 	return ret
+}
+
+func (s *Server) visibleOrderLocked() []string {
+	if s.activeChat != "" {
+		return s.chatOrder[s.activeChat]
+	}
+	return s.order
+}
+
+func (s *Server) visibleItemIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return append([]string(nil), s.visibleOrderLocked()...)
 }
 
 func (s *Server) handleImport(ctx context.Context) http.HandlerFunc {
@@ -187,11 +206,7 @@ func (s *Server) handleDownload(ctx context.Context) http.HandlerFunc {
 		var req request
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		if len(req.IDs) == 0 {
-			s.mu.RLock()
-			for _, id := range s.order {
-				req.IDs = append(req.IDs, id)
-			}
-			s.mu.RUnlock()
+			req.IDs = s.visibleItemIDs()
 		}
 		s.enqueueDownloadsExplicit(ctx, req.IDs)
 		writeJSON(w, map[string]any{"ok": true})
@@ -428,7 +443,12 @@ func (s *Server) handleStream(ctx context.Context) http.HandlerFunc {
 		target := item.TargetPath
 		mime := item.MIME
 		size := item.Size
+		itemType := item.Type
 		s.mu.RUnlock()
+		if itemType != mediaVideo {
+			http.Error(w, "not a video", http.StatusBadRequest)
+			return
+		}
 		s.preemptCoversForPlayback()
 		if f, err := os.Open(target); err == nil {
 			defer f.Close()
@@ -550,7 +570,12 @@ func (s *Server) handleFileDownload(w http.ResponseWriter, r *http.Request) {
 	path := item.TargetPath
 	name := item.Name
 	ready := item.Status == statusCompleted
+	itemType := item.Type
 	s.mu.RUnlock()
+	if itemType == mediaMessage || path == "" {
+		http.Error(w, "message has no downloadable file", http.StatusBadRequest)
+		return
+	}
 	if !ready {
 		http.Error(w, "file is not ready", http.StatusConflict)
 		return
@@ -568,33 +593,70 @@ func (s *Server) handleEvents(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
-	send := func() bool {
-		b, _ := json.Marshal(s.snapshot())
+	send := func(event string, payload any) bool {
+		b, _ := json.Marshal(payload)
+		if event != "" {
+			if _, err := fmt.Fprintf(w, "event: %s\n", event); err != nil {
+				return false
+			}
+		}
 		if _, err := fmt.Fprintf(w, "data: %s\n\n", b); err != nil {
 			return false
 		}
 		flusher.Flush()
 		return true
 	}
-	if !send() {
+	if !send("", s.snapshot()) {
 		return
 	}
 	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
+	progressTicker := time.NewTicker(time.Second)
+	defer progressTicker.Stop()
+	lastProgressVersion := s.progressVersion.Load()
 	for {
 		select {
 		case <-r.Context().Done():
 			return
 		case <-s.events:
-			if !send() {
+			if !send("", s.snapshot()) {
 				return
 			}
 		case <-ticker.C:
-			if !send() {
+			if !send("", s.snapshot()) {
 				return
+			}
+		case <-progressTicker.C:
+			version := s.progressVersion.Load()
+			if version == lastProgressVersion {
+				continue
+			}
+			lastProgressVersion = version
+			if progress := s.progressSnapshot(); len(progress) > 0 {
+				if !send("progress", map[string]any{"items": progress}) {
+					return
+				}
 			}
 		}
 	}
+}
+
+type progressItem struct {
+	ID       string `json:"id"`
+	Progress int64  `json:"progress"`
+}
+
+func (s *Server) progressSnapshot() []progressItem {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	items := make([]progressItem, 0, len(s.downloading))
+	for id := range s.downloading {
+		if item := s.items[id]; item != nil {
+			items = append(items, progressItem{ID: id, Progress: item.Progress})
+		}
+	}
+	return items
 }
 
 func tgSharedLimit() int {

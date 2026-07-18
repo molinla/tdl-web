@@ -32,3 +32,15 @@ func TestPickFileName(t *testing.T) {
 		t.Fatalf("got %q", name)
 	}
 }
+
+func TestTextAsStringFlattensTelegramExportEntities(t *testing.T) {
+	got := textAsString([]interface{}{
+		"hello ",
+		map[string]interface{}{"type": "bold", "text": "world"},
+		"\n",
+		map[string]interface{}{"type": "text_link", "text": "link"},
+	})
+	if got != "hello world\nlink" {
+		t.Fatalf("got %q", got)
+	}
+}

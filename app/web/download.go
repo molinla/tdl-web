@@ -682,7 +682,7 @@ func (s *Server) setProgress(id string, n int64) {
 		it.Progress = n
 	}
 	s.mu.Unlock()
-	s.notify()
+	s.progressVersion.Add(1)
 }
 
 func (s *Server) markCompleted(ctx context.Context, id string, logical int, size int64) {
@@ -691,8 +691,10 @@ func (s *Server) markCompleted(ctx context.Context, id string, logical int, size
 		it.Status = statusCompleted
 		it.Progress = size
 		it.Error = ""
+		if it.ChatID == "" {
+			s.finished[logical] = struct{}{}
+		}
 	}
-	s.finished[logical] = struct{}{}
 	s.mu.Unlock()
 	if s.jelly != nil {
 		s.jelly.RefreshSoon(ctx)

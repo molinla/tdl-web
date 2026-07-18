@@ -10,12 +10,21 @@ import (
 )
 
 type Session struct {
-	kv    Storage
-	login bool
+	kv         Storage
+	login      bool
+	storageKey string
 }
 
 func NewSession(kv Storage, login bool) telegram.SessionStorage {
-	return &Session{kv: kv, login: login}
+	return &Session{kv: kv, login: login, storageKey: keygen.New("session")}
+}
+
+// NewSessionWithKey keeps an additional Telegram session in the same namespace.
+func NewSessionWithKey(kv Storage, login bool, key string) telegram.SessionStorage {
+	if key == "" {
+		return NewSession(kv, login)
+	}
+	return &Session{kv: kv, login: login, storageKey: key}
 }
 
 func (s *Session) LoadSession(ctx context.Context) ([]byte, error) {
@@ -23,7 +32,7 @@ func (s *Session) LoadSession(ctx context.Context) ([]byte, error) {
 		return nil, nil
 	}
 
-	b, err := s.kv.Get(ctx, s.key())
+	b, err := s.kv.Get(ctx, s.storageKey)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			return nil, nil
@@ -34,9 +43,5 @@ func (s *Session) LoadSession(ctx context.Context) ([]byte, error) {
 }
 
 func (s *Session) StoreSession(ctx context.Context, data []byte) error {
-	return s.kv.Set(ctx, s.key(), data)
-}
-
-func (s *Session) key() string {
-	return keygen.New("session")
+	return s.kv.Set(ctx, s.storageKey, data)
 }

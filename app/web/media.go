@@ -100,6 +100,10 @@ func videoDuration(doc *tg.Document) int {
 }
 
 func renderName(tpl *template.Template, from peers.Peer, msg *tg.Message, item *media) (string, error) {
+	return renderNameForPeer(tpl, from.ID(), msg, item)
+}
+
+func renderNameForPeer(tpl *template.Template, peerID int64, msg *tg.Message, item *media) (string, error) {
 	var b strings.Builder
 	err := tpl.Execute(&b, struct {
 		DialogID     int64
@@ -110,7 +114,7 @@ func renderName(tpl *template.Template, from peers.Peer, msg *tg.Message, item *
 		FileSize     string
 		DownloadDate int64
 	}{
-		DialogID:     from.ID(),
+		DialogID:     peerID,
 		MessageID:    msg.ID,
 		MessageDate:  int64(msg.Date),
 		FileName:     item.Name,
