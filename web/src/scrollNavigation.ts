@@ -2,7 +2,7 @@ const scrollTargets = new Map<string, () => void>();
 
 export const RAIL_HEIGHT_RATIO = 0.84;
 export const RAIL_LINE_GAP = 8;
-export const CATEGORY_LINES_PER_SECTION = 4;
+export const SECTION_MARKERS_PER_SECTION = 0;
 
 export function registerScrollTarget(id: string, fn: () => void) {
   scrollTargets.set(id, fn);
@@ -181,10 +181,10 @@ function allocateBatchSlots(sections: RailItem[][], totalSlots: number): number[
 function sectionHeight(batchCount: number): number {
   const lineH = 3;
   const gap = RAIL_LINE_GAP;
-  const categoryLines = CATEGORY_LINES_PER_SECTION;
+  const sectionMarkers = SECTION_MARKERS_PER_SECTION;
 
-  let height = categoryLines * lineH;
-  height += Math.max(0, categoryLines - 1) * gap;
+  let height = sectionMarkers * lineH;
+  height += Math.max(0, sectionMarkers - 1) * gap;
 
   if (batchCount > 0) {
     height += gap;
@@ -209,18 +209,18 @@ function maxBatchSlotsForViewport(
   sectionCount: number,
 ): number {
   const railHeight = Math.max(280, viewportHeight * RAIL_HEIGHT_RATIO);
-  const minCategoryHeight = totalRailHeight(
+  const minSectionHeight = totalRailHeight(
     new Array(sectionCount).fill(0),
     sectionCount,
   );
 
   let low = 0;
-  let high = Math.max(0, Math.floor((railHeight - minCategoryHeight) / 10));
+  let high = Math.max(0, Math.floor((railHeight - minSectionHeight) / 10));
   let best = 0;
 
   while (low <= high) {
     const mid = Math.floor((low + high) / 2);
-    if (minCategoryHeight + mid * 10 <= railHeight) {
+    if (minSectionHeight + mid * 10 <= railHeight) {
       best = mid;
       low = mid + 1;
     } else {

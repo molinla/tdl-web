@@ -638,6 +638,24 @@ export function MediaPreview({
         <div className="preview-title-card">
           <h3>{displayName(item)}</h3>
           {date && <div className="preview-title-date">{date}</div>}
+          {(item.author || item.forwarded_from || item.saved_from) && (
+            <div className="preview-message-source">
+              {[
+                item.author,
+                item.forwarded_from
+                  ? `转发自 ${item.forwarded_from}`
+                  : "",
+                item.saved_from && item.saved_from !== item.forwarded_from
+                  ? `来自 ${item.saved_from}`
+                  : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")}
+            </div>
+          )}
+          {item.text?.trim() && (
+            <div className="preview-message-text">{item.text}</div>
+          )}
         </div>
         {player.kind === "video" && (
           <div className="preview-progress-row">

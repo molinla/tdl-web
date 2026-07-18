@@ -1,4 +1,4 @@
-export type MediaType = "video" | "image" | "file";
+export type MediaType = "video" | "image" | "file" | "message";
 export type ItemStatus =
   | "queued"
   | "caching"
@@ -9,6 +9,7 @@ export type ItemStatus =
 
 export interface Item {
   id: string;
+  chat_id?: string;
   peer_id: number;
   message_id: number;
   logical_pos: number;
@@ -18,6 +19,12 @@ export interface Item {
   size: number;
   duration?: number;
   date?: number;
+  message_kind?: string;
+  text?: string;
+  author?: string;
+  forwarded_from?: string;
+  saved_from?: string;
+  media_unavailable?: string;
   status: ItemStatus;
   progress: number;
   error?: string;
@@ -27,7 +34,7 @@ export interface Item {
   cover_aspect?: number;
   preview_url?: string;
   stream_url?: string;
-  download_url: string;
+  download_url?: string;
   resume_completed: boolean;
   skip_same: boolean;
   queue_pos?: number;
@@ -49,6 +56,22 @@ export interface ItemsPayload {
   queued_count?: number;
   cover_building_count?: number;
   cover_queued_count?: number;
+  active_chat?: string;
+  active_chat_title?: string;
+  chat_has_more?: boolean;
+}
+
+export interface ProgressPayload {
+  items: Array<{
+    id: string;
+    progress: number;
+  }>;
 }
 
 export type RangeType = "" | "id" | "time";
+
+export interface ChatInfo {
+  id: string;
+  title: string;
+  type: "saved" | "private" | "group" | "channel";
+}

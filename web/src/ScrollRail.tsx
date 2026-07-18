@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import {
   buildRailLayout,
-  CATEGORY_LINES_PER_SECTION,
   RAIL_HEIGHT_RATIO,
   RAIL_LINE_GAP,
   railBatchIndexAtPosition,
@@ -12,22 +11,18 @@ import {
 import type { Item } from "./types";
 
 const SECTION_META = [
-  { id: "section-videos", label: "视频" },
-  { id: "section-images", label: "图片" },
-  { id: "section-files", label: "文件" },
+  { id: "section-media", label: "媒体" },
 ] as const;
 
 type ScrollRailProps = {
   collapsed?: boolean;
-  videos: Item[];
-  images: Item[];
-  files: Item[];
+  items: Item[];
 };
 
 type FlatRailLine = {
   key: string;
   globalIndex: number;
-  kind: "section" | "batch";
+  kind: "batch";
   label: string;
   active: boolean;
   onClick: () => void;
@@ -63,25 +58,18 @@ function useViewportHeight() {
 
 export function ScrollRail({
   collapsed = false,
-  videos,
-  images,
-  files,
+  items,
 }: ScrollRailProps) {
   const viewportHeight = useViewportHeight();
 
   const sections = useMemo<RailSectionLayout[]>(
     () =>
       buildRailLayout(viewportHeight, [
-        { id: SECTION_META[0].id, label: SECTION_META[0].label, items: videos },
-        { id: SECTION_META[1].id, label: SECTION_META[1].label, items: images },
-        { id: SECTION_META[2].id, label: SECTION_META[2].label, items: files },
+        { id: SECTION_META[0].id, label: SECTION_META[0].label, items },
       ]),
-    [viewportHeight, videos, images, files],
+    [viewportHeight, items],
   );
 
-  const [activeSectionId, setActiveSectionId] = useState<string>(
-    SECTION_META[0].id,
-  );
   const [activeBatchId, setActiveBatchId] = useState<string | null>(null);
   const activePositionRef = useRef<{
     sectionId: string;
@@ -96,28 +84,6 @@ export function ScrollRail({
     let globalIndex = 0;
 
     for (const section of sections) {
-      const sectionActive =
-        activeSectionId === section.id &&
-        (!activeBatchId ||
-          !section.batches.some((batch) => batch.id === activeBatchId));
-
-      for (let i = 0; i < CATEGORY_LINES_PER_SECTION; i += 1) {
-        lines.push({
-          key: `${section.id}-marker-${i}`,
-          globalIndex,
-          kind: "section",
-          label: section.label,
-          active: sectionActive,
-          onClick: () => {
-            document.getElementById(section.id)?.scrollIntoView({
-              behavior: "auto",
-              block: "start",
-            });
-          },
-        });
-        globalIndex += 1;
-      }
-
       section.batches.forEach((batch, batchIndex) => {
         lines.push({
           key: batch.id,
@@ -132,7 +98,7 @@ export function ScrollRail({
     }
 
     return lines;
-  }, [sections, activeSectionId, activeBatchId]);
+  }, [sections, activeBatchId]);
 
   useEffect(() => {
     let raf = 0;
@@ -197,7 +163,6 @@ export function ScrollRail({
       activePositionRef.current = { sectionId: section.id, batchIndex };
       const batchId =
         batchIndex == null ? null : (section.batches[batchIndex]?.id ?? null);
-      setActiveSectionId((prev) => (prev === section.id ? prev : section.id));
       setActiveBatchId((prev) => (prev === batchId ? prev : batchId));
     }
 
@@ -232,7 +197,7 @@ export function ScrollRail({
       ]
         .filter(Boolean)
         .join(" ")}
-      aria-label="内容分区导航"
+      aria-label="媒体批次导航"
       style={railStyle}
     >
       <div className="scroll-rail-track">
@@ -244,11 +209,7 @@ export function ScrollRail({
             data-kind={line.kind}
             data-active={line.active ? "true" : undefined}
             onClick={line.onClick}
-            aria-label={
-              line.kind === "section"
-                ? `跳转到${line.label}`
-                : `跳转到${line.label}`
-            }
+            aria-label={`跳转到${line.label}`}
             aria-current={line.active ? "true" : undefined}
             data-label={line.label}
           >

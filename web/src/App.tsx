@@ -1,4 +1,8 @@
-import { useWindowVirtualizer, type Virtualizer } from "@tanstack/react-virtual";
+import {
+  useVirtualizer,
+  useWindowVirtualizer,
+  type Virtualizer,
+} from "@tanstack/react-virtual";
 import {
   useCallback,
   useEffect,
@@ -10,19 +14,27 @@ import {
   type ReactNode,
   type RefObject,
 } from "react";
-import { CloudDownload } from "lucide-react";
+import {
+  CloudDownload,
+  FileText,
+  MessageSquare,
+  X,
+} from "lucide-react";
 import {
   cacheItem,
   displayName,
   downloadItems,
+  fetchChats,
   fetchItems,
   formatDuration,
   formatMessageDate,
   formatSize,
   importJSON,
+  loadMoreChat,
   coverURL,
   pauseItem,
   progressPct,
+  selectChat,
   statusLabel,
   subscribeEvents,
   updateCoverState,
@@ -33,7 +45,14 @@ import { FilmBackground, type FilmClickDetail } from "./FilmBackground";
 import { MediaPreview } from "./MediaPreview";
 import { ScrollRail } from "./ScrollRail";
 import { AppSkeleton, StatusBar } from "./StatusBar";
-import type { Item, ItemsPayload, RangeType } from "./types";
+import { AuthGate } from "./AuthGate";
+import type {
+  ChatInfo,
+  Item,
+  ItemsPayload,
+  ProgressPayload,
+  RangeType,
+} from "./types";
 
 type PlayerState =
   | { kind: "video"; item: Item }
@@ -250,6 +269,10 @@ function estimateMasonryItemSize(
   columnWidth: number,
 ) {
   if (!item) return fallback;
+
+  if (item.type === "file" && columnWidth > 0) {
+    return Math.max(1, Math.ceil(columnWidth * DEFAULT_COVER_ASPECT));
+  }
 
   const ratio = coverAspectCache.get(item.id);
   if (ratio && columnWidth > 0) {
@@ -817,6 +840,265 @@ function LazyCover({
   );
 }
 
+function messageSummary(item: Item): string {
+  const text = item.text?.trim();
+  if (text) return text;
+  if (item.media_unavailable) return "媒体暂不可预览";
+  if (item.message_kind === "service") return "服务消息";
+  return displayName(item);
+}
+
+function messageSource(item: Item): string {
+  const parts: string[] = [];
+  if (item.author) parts.push(item.author);
+  if (item.forwarded_from) parts.push(`转发自 ${item.forwarded_from}`);
+  if (item.saved_from && item.saved_from !== item.forwarded_from) {
+    parts.push(`来自 ${item.saved_from}`);
+  }
+  return parts.join(" · ");
+}
+
+function VirtualMessageList({
+  items,
+  renderItem,
+  contained = false,
+}: {
+  items: Item[];
+  renderItem: (item: Item) => ReactNode;
+  contained?: boolean;
+}) {
+  const windowRef = useRef<HTMLDivElement>(null);
+  const containedRef = useRef<HTMLDivElement>(null);
+  const scrollMargin = useScrollMargin(windowRef, items.length);
+  const overscan = useVirtualOverscan(104, 0);
+  const windowVirtualizer = useWindowVirtualizer({
+    count: items.length,
+    estimateSize: () => 104,
+    overscan,
+    scrollMargin,
+    getItemKey: (index) => items[index]?.id ?? index,
+  });
+  const containedVirtualizer = useVirtualizer({
+    count: items.length,
+    estimateSize: () => 104,
+    overscan,
+    getScrollElement: () => containedRef.current,
+    getItemKey: (index) => items[index]?.id ?? index,
+  });
+  const virtualizer = contained ? containedVirtualizer : windowVirtualizer;
+  const ref = contained ? containedRef : windowRef;
+  const offset = contained ? 0 : scrollMargin;
+
+  return (
+    <div
+      ref={ref}
+      className={["message-list", contained ? "message-list--contained" : ""]
+        .filter(Boolean)
+        .join(" ")}
+    >
+      <div
+        className="message-list-inner"
+        style={{ height: virtualizer.getTotalSize(), position: "relative" }}
+      >
+        {virtualizer.getVirtualItems().map((virtualItem) => {
+          const item = items[virtualItem.index];
+          if (!item) return null;
+          return (
+            <div
+              key={virtualItem.key}
+              className="message-list-item"
+              data-index={virtualItem.index}
+              ref={virtualizer.measureElement}
+              style={{
+                position: "absolute",
+                top: 0,
+                left: 0,
+                width: "100%",
+                transform: `translateY(${virtualItem.start - offset}px)`,
+              }}
+            >
+              {renderItem(item)}
+            </div>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
+function MessageDrawer({
+  items,
+  onClose,
+  onOpen,
+}: {
+  items: Item[];
+  onClose: () => void;
+  onOpen: (item: Item, target: HTMLElement) => void;
+}) {
+  useEffect(() => {
+    const root = document.documentElement;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    root.classList.add("body-scroll-locked");
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      root.classList.remove("body-scroll-locked");
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+
+  return (
+    <div className="message-drawer-root">
+      <button
+        type="button"
+        className="message-drawer-backdrop"
+        aria-label="关闭消息抽屉"
+        onClick={onClose}
+      />
+      <aside className="message-drawer" aria-label="文本消息" role="dialog">
+        <div className="message-drawer-header">
+          <div>
+            <strong>Messages</strong>
+            <span>{items.length} 条</span>
+          </div>
+          <button
+            type="button"
+            className="message-drawer-close"
+            aria-label="关闭消息抽屉"
+            onClick={onClose}
+          >
+            <X size={22} strokeWidth={1.8} aria-hidden="true" />
+          </button>
+        </div>
+        {items.length === 0 ? (
+          <div className="empty">暂无文本消息。</div>
+        ) : (
+          <VirtualMessageList
+            contained
+            items={items}
+            renderItem={(item) => {
+              const source = messageSource(item);
+              const date = formatMessageDate(item.date);
+              return (
+                <button
+                  type="button"
+                  className={[
+                    "message-row",
+                    item.message_kind === "service"
+                      ? "message-row--service"
+                      : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                  onClick={(event) => onOpen(item, event.currentTarget)}
+                >
+                  <div className="message-row-copy">
+                    <div className="message-row-meta">
+                      {[source, date, `#${item.message_id}`]
+                        .filter(Boolean)
+                        .join(" · ")}
+                    </div>
+                    <div className="message-row-text">
+                      {messageSummary(item)}
+                    </div>
+                    {item.media_unavailable && (
+                      <div className="message-row-unavailable">
+                        {item.media_unavailable}
+                      </div>
+                    )}
+                  </div>
+                </button>
+              );
+            }}
+          />
+        )}
+      </aside>
+    </div>
+  );
+}
+
+function MessagePreview({
+  item,
+  onClose,
+  onCache,
+  onPause,
+}: {
+  item: Item;
+  onClose: () => void;
+  onCache: (item: Item) => void;
+  onPause: (item: Item) => void;
+}) {
+  useEffect(() => {
+    const root = document.documentElement;
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    root.classList.add("body-scroll-locked");
+    window.addEventListener("keydown", onKeyDown);
+    return () => {
+      root.classList.remove("body-scroll-locked");
+      window.removeEventListener("keydown", onKeyDown);
+    };
+  }, [onClose]);
+
+  const source = messageSource(item);
+  const date = formatMessageDate(item.date);
+
+  return (
+    <div className="message-preview-root">
+      <button
+        type="button"
+        className="message-preview-backdrop"
+        aria-label="关闭消息预览"
+        onClick={onClose}
+      />
+      <button
+        type="button"
+        className="message-preview-close"
+        aria-label="关闭"
+        onClick={onClose}
+      >
+        <X size={42} strokeWidth={1.6} aria-hidden="true" />
+      </button>
+      <article className="message-preview-content">
+        <div className="message-preview-meta">
+          {[source, date, `#${item.message_id}`].filter(Boolean).join(" · ")}
+        </div>
+        <div className="message-preview-text">{messageSummary(item)}</div>
+        {item.media_unavailable && (
+          <div className="message-preview-note">{item.media_unavailable}</div>
+        )}
+        {item.type === "file" && (
+          <div className="message-preview-file">
+            <strong>{displayName(item)}</strong>
+            <span>{formatSize(item.size)}</span>
+            {item.status === "caching" ? (
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => onPause(item)}
+              >
+                暂停
+              </button>
+            ) : item.status === "completed" ? (
+              <span>已落盘</span>
+            ) : (
+              <button
+                type="button"
+                className="btn ghost"
+                onClick={() => onCache(item)}
+              >
+                {item.status === "paused" ? "继续下载" : "下载到目录"}
+              </button>
+            )}
+          </div>
+        )}
+      </article>
+    </div>
+  );
+}
+
 function DownloadDock({ items }: { items: Item[] }) {
   const active = useMemo(() => {
     const caching = items.filter((i) => i.status === "caching");
@@ -860,6 +1142,14 @@ function DownloadDock({ items }: { items: Item[] }) {
 }
 
 export default function App() {
+  return (
+    <AuthGate>
+      <MediaApp />
+    </AuthGate>
+  );
+}
+
+function MediaApp() {
   const [items, setItems] = useState<Item[]>([]);
   const [apiReady, setApiReady] = useState(false);
   const [importing, setImporting] = useState(false);
@@ -883,10 +1173,19 @@ export default function App() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [file, setFile] = useState<File | null>(null);
+  const [chats, setChats] = useState<ChatInfo[]>([]);
+  const [chatsLoading, setChatsLoading] = useState(true);
+  const [activeChat, setActiveChat] = useState("");
+  const [activeChatTitle, setActiveChatTitle] = useState("");
+  const [chatHasMore, setChatHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [messageDrawerOpen, setMessageDrawerOpen] = useState(false);
+  const loadingMoreRef = useRef(false);
   const [rangeType, setRangeType] = useState<RangeType>("");
   const [from, setFrom] = useState("");
   const [to, setTo] = useState("");
   const [player, setPlayer] = useState<PlayerState>(null);
+  const [messagePreview, setMessagePreview] = useState<Item | null>(null);
   const [previewOrigin, setPreviewOrigin] = useState<DOMRectReadOnly | null>(
     null,
   );
@@ -907,7 +1206,7 @@ export default function App() {
     else set.delete(id);
     setCoverLoadingCount(set.size);
   }, []);
-  const applyPayload = (payload: ItemsPayload) => {
+  const applyPayload = useCallback((payload: ItemsPayload) => {
     setItems(payload.items ?? []);
     setImporting(payload.importing);
     setImportError(payload.import_error ?? "");
@@ -921,7 +1220,24 @@ export default function App() {
     setQueuedCount(payload.queued_count ?? 0);
     setCoverBuildingCount(payload.cover_building_count ?? 0);
     setCoverQueuedCount(payload.cover_queued_count ?? 0);
+    setActiveChat(payload.active_chat ?? "");
+    setActiveChatTitle(payload.active_chat_title ?? "");
+    setChatHasMore(payload.chat_has_more ?? false);
     setApiReady(true);
+  }, []);
+
+  const applyProgress = (payload: ProgressPayload) => {
+    const updates = new Map(payload.items.map((update) => [update.id, update.progress]));
+    setItems((current) => {
+      let changed = false;
+      const next = current.map((item) => {
+        const progress = updates.get(item.id);
+        if (progress == null || progress === item.progress) return item;
+        changed = true;
+        return { ...item, progress };
+      });
+      return changed ? next : current;
+    });
   };
 
   useEffect(() => {
@@ -937,11 +1253,24 @@ export default function App() {
           setError(err.message || "无法连接 API，请先启动 tdl web");
         }
       });
+    fetchChats()
+      .then((next) => {
+        if (alive) setChats(next);
+      })
+      .catch((err: Error) => {
+        if (alive) setError(err.message);
+      })
+      .finally(() => {
+        if (alive) setChatsLoading(false);
+      });
 
-    const stop = subscribeEvents((payload) => {
-      applyPayload(payload);
-      setError("");
-    });
+    const stop = subscribeEvents(
+      (payload) => {
+        applyPayload(payload);
+        setError("");
+      },
+      applyProgress,
+    );
     return () => {
       alive = false;
       stop();
@@ -952,28 +1281,26 @@ export default function App() {
     () => [...items].sort(compareTimelineItems),
     [items],
   );
-  const videos = useMemo(
-    () => displayItems.filter((i) => i.type === "video"),
+  const mediaItems = useMemo(
+    () => displayItems.filter((i) => i.type !== "message"),
     [displayItems],
   );
-  const images = useMemo(
-    () => displayItems.filter((i) => i.type === "image"),
-    [displayItems],
-  );
-  const files = useMemo(
-    () => displayItems.filter((i) => i.type === "file"),
+  const messageItems = useMemo(
+    () => displayItems.filter((i) => i.type === "message"),
     [displayItems],
   );
   const previewMediaItems = useMemo(
-    () => displayItems.filter((i) => i.type === "video" || i.type === "image"),
-    [displayItems],
+    () => mediaItems.filter((i) => i.type === "video" || i.type === "image"),
+    [mediaItems],
   );
   const [backgroundItems, setBackgroundItems] = useState<Item[]>([]);
-  const pendingVideoBackgroundStageRef = useRef<number | null>(null);
-  const pendingImageBackgroundStageRef = useRef<number | null>(null);
+  const pendingMediaBackgroundStageRef = useRef<number | null>(null);
   const backgroundSettleTimerRef = useRef<number | null>(null);
   const backgroundStageKeyRef = useRef("");
-  const done = items.filter((i) => i.status === "completed").length;
+  const mediaItemCount = mediaItems.length;
+  const done = items.filter(
+    (i) => i.type !== "message" && i.status === "completed",
+  ).length;
 
   const scheduleBackgroundItemsUpdate = useCallback(() => {
     if (backgroundSettleTimerRef.current != null) {
@@ -981,19 +1308,13 @@ export default function App() {
     }
     backgroundSettleTimerRef.current = window.setTimeout(() => {
       backgroundSettleTimerRef.current = null;
-      const videoStage = pendingVideoBackgroundStageRef.current;
-      const imageStage = pendingImageBackgroundStageRef.current;
-      const videoItems = stageItems(videos, videoStage);
-      const imageItems = stageItems(images, imageStage);
-      const stageKey = [
-        videoItems.length > 0 && videoStage != null ? `video:${videoStage}` : "",
-        imageItems.length > 0 && imageStage != null ? `image:${imageStage}` : "",
-      ]
-        .filter(Boolean)
-        .join("|");
+      const stage = pendingMediaBackgroundStageRef.current;
+      const stagedItems = stageItems(mediaItems, stage);
+      const stageKey =
+        stagedItems.length > 0 && stage != null ? `media:${stage}` : "";
       if (!stageKey || stageKey === backgroundStageKeyRef.current) return;
 
-      const next = uniqueItems([...videoItems, ...imageItems]).filter((item) =>
+      const next = uniqueItems(stagedItems).filter((item) =>
         coverReadyIdsRef.current.has(item.id),
       );
       if (next.length === 0) return;
@@ -1001,7 +1322,7 @@ export default function App() {
       backgroundStageKeyRef.current = stageKey;
       setBackgroundItems(next);
     }, FILM_BACKGROUND_SETTLE_MS);
-  }, [images, videos]);
+  }, [mediaItems]);
 
   const onCoverReady = useCallback(
     (id: string) => {
@@ -1013,25 +1334,13 @@ export default function App() {
     [scheduleBackgroundItemsUpdate],
   );
 
-  const handleVideoVirtualItemsChange = useCallback(
+  const handleMediaVirtualItemsChange = useCallback(
     (entries: VirtualWindowEntry[]) => {
       const stage = stageFromVirtualWindow(entries);
-      if (stage == null || pendingVideoBackgroundStageRef.current === stage) {
+      if (stage == null || pendingMediaBackgroundStageRef.current === stage) {
         return;
       }
-      pendingVideoBackgroundStageRef.current = stage;
-      scheduleBackgroundItemsUpdate();
-    },
-    [scheduleBackgroundItemsUpdate],
-  );
-
-  const handleImageVirtualItemsChange = useCallback(
-    (entries: VirtualWindowEntry[]) => {
-      const stage = stageFromVirtualWindow(entries);
-      if (stage == null || pendingImageBackgroundStageRef.current === stage) {
-        return;
-      }
-      pendingImageBackgroundStageRef.current = stage;
+      pendingMediaBackgroundStageRef.current = stage;
       scheduleBackgroundItemsUpdate();
     },
     [scheduleBackgroundItemsUpdate],
@@ -1058,11 +1367,17 @@ export default function App() {
     const fresh = items.find((i) => i.id === player.item.id);
     return fresh ? { ...player, item: fresh } : player;
   }, [player, items]);
+  const liveMessagePreview = useMemo(() => {
+    if (!messagePreview) return null;
+    return items.find((item) => item.id === messagePreview.id) ?? messagePreview;
+  }, [items, messagePreview]);
   const coverPlaybackPaused = Boolean(
     cardOverlayHiddenId || livePlayer?.kind === "video",
   );
   coverPlaybackPausedRef.current = coverPlaybackPaused;
-  const chromeCollapsed = Boolean(livePlayer || cardOverlayHiddenId);
+  const chromeCollapsed = Boolean(
+    livePlayer || liveMessagePreview || cardOverlayHiddenId,
+  );
 
   const flushCoverState = useCallback((keepalive = false) => {
     void updateCoverState(
@@ -1139,6 +1454,53 @@ export default function App() {
     }
   }
 
+  async function onSelectChat(id: string) {
+    setBusy(true);
+    setError("");
+    try {
+      applyPayload(await selectChat(id));
+    } catch (err) {
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const onLoadMore = useCallback(async () => {
+    if (!activeChat || !chatHasMore || importing || loadingMoreRef.current) {
+      return;
+    }
+    loadingMoreRef.current = true;
+    setLoadingMore(true);
+    try {
+      applyPayload(await loadMoreChat());
+    } catch (err) {
+      setChatHasMore(false);
+      setError(err instanceof Error ? err.message : String(err));
+    } finally {
+      loadingMoreRef.current = false;
+      setLoadingMore(false);
+    }
+  }, [activeChat, applyPayload, chatHasMore, importing]);
+
+  useEffect(() => {
+    if (!activeChat || !chatHasMore || loadingMore) return;
+    const check = () => {
+      const bottom =
+        document.documentElement.scrollHeight -
+        (window.scrollY + window.innerHeight);
+      if (bottom <= window.innerHeight * 2) {
+        void onLoadMore();
+      }
+    };
+    window.addEventListener("scroll", check, { passive: true });
+    const frame = window.requestAnimationFrame(check);
+    return () => {
+      window.removeEventListener("scroll", check);
+      window.cancelAnimationFrame(frame);
+    };
+  }, [activeChat, chatHasMore, loadingMore, onLoadMore]);
+
   async function onCache(item: Item) {
     try {
       await cacheItem(item.id);
@@ -1161,6 +1523,24 @@ export default function App() {
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     }
+  }
+
+  const closeMessagePreview = useCallback(() => {
+    setMessagePreview(null);
+  }, []);
+
+  function openMessageItem(item: Item, target: HTMLElement) {
+    setMessagePreview(null);
+    if (item.type === "video") {
+      openVideoPlayer(item, target);
+      return;
+    }
+    if (item.type === "image") {
+      openPlayer("image", item, target);
+      return;
+    }
+    clearPendingOpen();
+    setMessagePreview(item);
   }
 
   function getPreviewSourceEl(target: HTMLElement): HTMLElement {
@@ -1268,6 +1648,110 @@ export default function App() {
     );
   }
 
+  function renderMediaItem(item: Item) {
+    const isVideo = item.type === "video";
+    const hasCover = isVideo || item.type === "image";
+    const source = messageSource(item);
+    const cardMeta = [
+      formatMessageDate(item.date),
+      isVideo ? formatDuration(item.duration) : "",
+      formatSize(item.size),
+      source,
+    ]
+      .filter(Boolean)
+      .join(" · ");
+
+    return (
+      <div
+        className="card-wrap"
+        id={`scroll-item-${item.id}`}
+        data-scroll-item={item.id}
+      >
+        <button
+          type="button"
+          className={["card", item.type === "file" ? "card--file" : ""]
+            .filter(Boolean)
+            .join(" ")}
+          title={displayName(item)}
+          onClick={(event) => openMessageItem(item, event.currentTarget)}
+        >
+          <StatusBadge item={item} maxQueuePos={VIDEO_QUEUE_DISPLAY_LIMIT} />
+          <div className="card-cover">
+            {hasCover ? (
+              <LazyCover
+                className="poster"
+                fallbackText={isVideo ? "Video" : "Image"}
+                src={coverURL(
+                  item.cover || item.thumb_url || item.preview_url,
+                )}
+                alt={displayName(item)}
+                coverId={item.id}
+                aspectRatio={item.cover_aspect}
+                coverPriority={isVideo ? "high" : "normal"}
+                previewSourceId={item.id}
+                previewHidden={livePlayer?.item.id === item.id}
+                loadingPaused={coverPlaybackPaused}
+                onLoadingChange={onCoverLoadingChange}
+                onReady={onCoverReady}
+                onVisibilityChange={
+                  isVideo ? onVideoCoverVisibilityChange : undefined
+                }
+              />
+            ) : (
+              <div className="card-file-cover">
+                <FileText size={48} strokeWidth={1.2} aria-hidden="true" />
+                <span>{item.mime || "FILE"}</span>
+              </div>
+            )}
+            <div
+              className={[
+                "card-overlay",
+                cardOverlayHiddenId === item.id
+                  ? "card-overlay--hidden"
+                  : "",
+              ]
+                .filter(Boolean)
+                .join(" ")}
+            >
+              <div className="card-overlay-inner">
+                <div className="card-title">{displayName(item)}</div>
+                <div className="card-meta">
+                  <div className="card-sub">{cardMeta}</div>
+                  {item.status === "queued" && (
+                    <div className="card-status">
+                      {(item.queue_pos ?? 0) > 0 &&
+                      (item.queue_pos ?? 0) <= VIDEO_QUEUE_DISPLAY_LIMIT ? (
+                        statusLabel(item)
+                      ) : (
+                        <CloudDownload
+                          className="card-cloud-icon"
+                          size={14}
+                          strokeWidth={2}
+                          aria-label="未缓存"
+                        />
+                      )}
+                    </div>
+                  )}
+                </div>
+                {item.media_unavailable && (
+                  <div className="card-note">{item.media_unavailable}</div>
+                )}
+              </div>
+              {(item.status === "caching" ||
+                item.status === "paused" ||
+                item.progress > 0) &&
+                item.status !== "completed" && (
+                  <div className="progress">
+                    <span style={{ width: `${progressPct(item)}%` }} />
+                  </div>
+                )}
+            </div>
+          </div>
+        </button>
+      </div>
+    );
+  }
+
   return (
     <>
       {apiReady && backgroundItems.length > 0 && (
@@ -1316,52 +1800,92 @@ export default function App() {
       <DownloadDock items={items} />
 
       <section className="toolbar">
-        <div className="field">
-          <label>JSON 导出</label>
-          <input
-            type="file"
-            accept=".json,application/json"
-            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
-          />
-        </div>
-        <div className="field">
-          <label>范围类型</label>
+        <div className="field source-field">
+          <label>消息来源</label>
           <select
-            value={rangeType}
-            onChange={(e) => setRangeType(e.target.value as RangeType)}
+            value={activeChat}
+            disabled={busy || importing || chatsLoading}
+            onChange={(e) => void onSelectChat(e.target.value)}
           >
-            <option value="">全部</option>
-            <option value="id">消息 ID</option>
-            <option value="time">时间戳</option>
+            <option value="">本地 JSON</option>
+            {chats.map((chat) => (
+              <option key={chat.id} value={chat.id}>
+                {chat.title}
+                {chat.type === "channel"
+                  ? " · 频道"
+                  : chat.type === "private"
+                    ? " · 私聊"
+                    : ""}
+              </option>
+            ))}
           </select>
         </div>
-        <div className="field">
-          <label>From</label>
-          <input
-            value={from}
-            onChange={(e) => setFrom(e.target.value)}
-            placeholder="起始"
-            disabled={!rangeType}
-          />
-        </div>
-        <div className="field">
-          <label>To</label>
-          <input
-            value={to}
-            onChange={(e) => setTo(e.target.value)}
-            placeholder="结束"
-            disabled={!rangeType}
-          />
-        </div>
-        <button className="btn" disabled={!file || busy || importing} onClick={onImport}>
-          {busy ? "导入中…" : "导入"}
-        </button>
+        {activeChat ? (
+          <div className="live-source">
+            <span className="live-dot" />
+            <strong>{activeChatTitle}</strong>
+            <span>实时监听 · 向下滚动加载历史</span>
+          </div>
+        ) : (
+          <>
+            <div className="field">
+              <label>JSON 导出</label>
+              <input
+                type="file"
+                accept=".json,application/json"
+                onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+              />
+            </div>
+            <div className="field">
+              <label>范围类型</label>
+              <select
+                value={rangeType}
+                onChange={(e) => setRangeType(e.target.value as RangeType)}
+              >
+                <option value="">全部</option>
+                <option value="id">消息 ID</option>
+                <option value="time">时间戳</option>
+              </select>
+            </div>
+            <div className="field">
+              <label>From</label>
+              <input
+                value={from}
+                onChange={(e) => setFrom(e.target.value)}
+                placeholder="起始"
+                disabled={!rangeType}
+              />
+            </div>
+            <div className="field">
+              <label>To</label>
+              <input
+                value={to}
+                onChange={(e) => setTo(e.target.value)}
+                placeholder="结束"
+                disabled={!rangeType}
+              />
+            </div>
+            <button className="btn" disabled={!file || busy || importing} onClick={onImport}>
+              {busy ? "导入中…" : "导入"}
+            </button>
+          </>
+        )}
         <button
           className="btn ghost"
-          disabled={!items.length || importing}
+          disabled={!mediaItemCount || importing}
           onClick={onDownloadAll}
         >
           下载全部
+        </button>
+        <button
+          type="button"
+          className="icon-btn"
+          aria-label="打开文本消息"
+          title="文本消息"
+          disabled={messageItems.length === 0}
+          onClick={() => setMessageDrawerOpen(true)}
+        >
+          <MessageSquare size={18} strokeWidth={1.8} aria-hidden="true" />
         </button>
       </section>
 
@@ -1375,217 +1899,47 @@ export default function App() {
       ) : (
         <>
       {apiReady && (
-        <ScrollRail
-          collapsed={chromeCollapsed}
-          videos={videos}
-          images={images}
-          files={files}
+        <>
+          <ScrollRail collapsed={chromeCollapsed} items={mediaItems} />
+          <section id="section-media" className="section media-section">
+            <h2>Media</h2>
+            {mediaItems.length === 0 ? (
+              <div className="empty">
+                {importing
+                  ? "正在加载媒体列表…"
+                  : activeChat
+                    ? "最近消息中暂无视频、图片或文件。"
+                    : "暂无媒体。导入 JSON 后会显示统一瀑布流。"}
+              </div>
+            ) : (
+              <VirtualMasonry
+                className="media-grid masonry-flow"
+                items={mediaItems}
+                minColumnWidth={280}
+                gap={16}
+                estimateSize={320}
+                onVirtualItemsChange={handleMediaVirtualItemsChange}
+                renderItem={renderMediaItem}
+              />
+            )}
+          </section>
+        </>
+      )}
+      {messageDrawerOpen && (
+        <MessageDrawer
+          items={messageItems}
+          onClose={() => setMessageDrawerOpen(false)}
+          onOpen={(item, target) => {
+            setMessageDrawerOpen(false);
+            openMessageItem(item, target);
+          }}
         />
       )}
-      <section id="section-videos" className="section">
-        <h2>Videos</h2>
-        {videos.length === 0 ? (
-          <div className="empty">
-            {importing ? "正在加载视频列表…" : "暂无视频。导入 JSON 后会显示封面墙。"}
-          </div>
-        ) : (
-          <VirtualMasonry
-            className="video-grid masonry-flow"
-            items={videos}
-            minColumnWidth={280}
-            gap={16}
-            estimateSize={320}
-            onVirtualItemsChange={handleVideoVirtualItemsChange}
-            renderItem={(item) => (
-              <div
-                className="card-wrap"
-                id={`scroll-item-${item.id}`}
-                data-scroll-item={item.id}
-              >
-                <button
-                  type="button"
-                  className="card"
-                  onClick={(e) =>
-                    openVideoPlayer(item, e.currentTarget)
-                  }
-                >
-                  <StatusBadge
-                    item={item}
-                    maxQueuePos={VIDEO_QUEUE_DISPLAY_LIMIT}
-                  />
-                  <div className="card-cover">
-                    <LazyCover
-                      className="poster"
-                      src={coverURL(item.cover || item.thumb_url)}
-                      alt={displayName(item)}
-                      coverId={item.id}
-                      aspectRatio={item.cover_aspect}
-                      coverPriority="high"
-                      previewSourceId={item.id}
-                      previewHidden={livePlayer?.item.id === item.id}
-                      loadingPaused={coverPlaybackPaused}
-                      onLoadingChange={onCoverLoadingChange}
-                      onReady={onCoverReady}
-                      onVisibilityChange={onVideoCoverVisibilityChange}
-                    />
-                    <div
-                      className={[
-                        "card-overlay",
-                        cardOverlayHiddenId === item.id
-                          ? "card-overlay--hidden"
-                          : "",
-                      ]
-                        .filter(Boolean)
-                        .join(" ")}
-                    >
-                      <div className="card-overlay-inner">
-                        <div className="card-title">{displayName(item)}</div>
-                        <div className="card-meta">
-                          <div className="card-sub">
-                            {[
-                              formatMessageDate(item.date),
-                              formatDuration(item.duration),
-                              formatSize(item.size),
-                            ]
-                              .filter(Boolean)
-                              .join(" · ")}
-                          </div>
-                          {item.status === "queued" && (
-                            <div className="card-status">
-                              {(item.queue_pos ?? 0) > 0 &&
-                              (item.queue_pos ?? 0) <=
-                                VIDEO_QUEUE_DISPLAY_LIMIT ? (
-                                statusLabel(item)
-                              ) : (
-                                <CloudDownload
-                                  className="card-cloud-icon"
-                                  size={14}
-                                  strokeWidth={2}
-                                  aria-label="未缓存"
-                                />
-                              )}
-                            </div>
-                          )}
-                        </div>
-                      </div>
-                      {(item.status === "caching" ||
-                        item.status === "paused" ||
-                        item.progress > 0) &&
-                        item.status !== "completed" && (
-                          <div className="progress">
-                            <span style={{ width: `${progressPct(item)}%` }} />
-                          </div>
-                        )}
-                    </div>
-                  </div>
-                </button>
-              </div>
-            )}
-          />
-        )}
-      </section>
-
-      <section id="section-images" className="section">
-        <h2>Images</h2>
-        {images.length === 0 ? (
-          <div className="empty">
-            {importing ? "正在加载图片列表…" : "暂无图片。"}
-          </div>
-        ) : (
-          <VirtualMasonry
-            className="image-grid masonry-flow"
-            items={images}
-            minColumnWidth={160}
-            gap={12}
-            estimateSize={200}
-            onVirtualItemsChange={handleImageVirtualItemsChange}
-            renderItem={(item) => (
-              <button
-                type="button"
-                className="image-tile"
-                id={`scroll-item-${item.id}`}
-                data-scroll-item={item.id}
-                onClick={(e) => openPlayer("image", item, e.currentTarget)}
-                title={`${displayName(item)} · ${statusLabel(item)}${
-                  item.date ? ` · ${formatMessageDate(item.date)}` : ""
-                }`}
-              >
-                <StatusBadge item={item} />
-                <LazyCover
-                  className=""
-                  fallbackClass="tile-fallback"
-                  fallbackText="No Image"
-                  src={coverURL(item.thumb_url || item.preview_url)}
-                  alt={displayName(item)}
-                  coverId={item.id}
-                  aspectRatio={item.cover_aspect}
-                  previewSourceId={item.id}
-                  previewHidden={livePlayer?.item.id === item.id}
-                  loadingPaused={coverPlaybackPaused}
-                  onLoadingChange={onCoverLoadingChange}
-                  onReady={onCoverReady}
-                />
-              </button>
-            )}
-          />
-        )}
-      </section>
-
-      <section id="section-files" className="section">
-        <h2>Files</h2>
-        {files.length === 0 ? (
-          <div className="empty">暂无压缩包或其它文件。</div>
-        ) : (
-          <div className="file-list">
-            {files.map((item) => (
-              <div
-                key={item.id}
-                id={`scroll-item-${item.id}`}
-                data-scroll-item={item.id}
-                className="file-row"
-              >
-                <div>
-                  <strong>{displayName(item)}</strong>
-                  <div className="muted">
-                    {[
-                      formatMessageDate(item.date),
-                      formatSize(item.size),
-                      statusLabel(item),
-                    ]
-                      .filter(Boolean)
-                      .join(" · ")}
-                  </div>
-                  {(item.status === "caching" || item.status === "paused") && (
-                    <div className="progress">
-                      <span style={{ width: `${progressPct(item)}%` }} />
-                    </div>
-                  )}
-                </div>
-                <span className="muted">{item.status}</span>
-                <div className="file-actions">
-                  {item.status === "caching" ? (
-                    <button className="btn ghost" onClick={() => onPause(item)}>
-                      暂停
-                    </button>
-                  ) : (
-                    <button
-                      className="btn ghost"
-                      disabled={item.status === "completed"}
-                      onClick={() => onCache(item)}
-                    >
-                      {item.status === "completed"
-                        ? "已落盘"
-                        : item.status === "paused"
-                          ? "继续下载"
-                          : "下载到目录"}
-                    </button>
-                  )}
-                </div>
-              </div>
-            ))}
-          </div>
-        )}
-      </section>
+      {activeChat && (loadingMore || chatHasMore) && (
+        <div className="empty">
+          {loadingMore ? "正在加载更早消息…" : "继续向下滚动加载更早消息"}
+        </div>
+      )}
         </>
       )}
 
@@ -1612,6 +1966,14 @@ export default function App() {
           onCloseRequest={requestClosePlayer}
           onClosed={finalizeClosePlayer}
           onPause={onPause}
+        />
+      )}
+      {liveMessagePreview && (
+        <MessagePreview
+          item={liveMessagePreview}
+          onClose={closeMessagePreview}
+          onCache={(item) => void onCache(item)}
+          onPause={(item) => void onPause(item)}
         />
       )}
     </>

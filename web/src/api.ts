@@ -1,4 +1,10 @@
-import type { Item, ItemsPayload, RangeType } from "./types";
+import type {
+  ChatInfo,
+  Item,
+  ItemsPayload,
+  ProgressPayload,
+  RangeType,
+} from "./types";
 
 const token = new URLSearchParams(window.location.search).get("token") ?? "";
 
@@ -45,8 +51,96 @@ export function coverURL(path?: string, revision?: string | number): string {
   return u.toString();
 }
 
+export type AuthState =
+  | "checking"
+  | "unauthorized"
+  | "waiting_scan"
+  | "password_required"
+  | "authorizing"
+  | "authorized"
+  | "error";
+
+export interface AuthStatus {
+  status: AuthState;
+  authorized: boolean;
+  error?: string;
+  qr_revision?: number;
+  expires_at?: number;
+  can_switch_back: boolean;
+}
+
+export async function fetchAuthStatus(): Promise<AuthStatus> {
+  const res = await fetch(apiURL("/api/auth/status"), {
+    headers: headers(),
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function startQRLogin(): Promise<AuthStatus> {
+  const res = await fetch(apiURL("/api/auth/qr"), {
+    method: "POST",
+    headers: headers(),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export function qrImageURL(revision?: number): string {
+  return apiURL(`/api/auth/qr.png?v=${revision ?? 0}`);
+}
+
+export async function submitAuthPassword(password: string): Promise<AuthStatus> {
+  const res = await fetch(apiURL("/api/auth/password"), {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ password }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function switchAuthAccount(previous = false): Promise<void> {
+  const res = await fetch(apiURL("/api/auth/switch"), {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ previous }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+}
+
 export async function fetchItems(): Promise<ItemsPayload> {
   const res = await fetch(apiURL("/api/items"), { headers: headers() });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function fetchChats(): Promise<ChatInfo[]> {
+  const res = await fetch(apiURL("/api/chats"), {
+    headers: headers(),
+    cache: "no-store",
+  });
+  if (!res.ok) throw new Error(await res.text());
+  const payload = (await res.json()) as { chats?: ChatInfo[] };
+  return payload.chats ?? [];
+}
+
+export async function selectChat(id: string): Promise<ItemsPayload> {
+  const res = await fetch(apiURL("/api/chats/select"), {
+    method: "POST",
+    headers: headers({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ id }),
+  });
+  if (!res.ok) throw new Error(await res.text());
+  return res.json();
+}
+
+export async function loadMoreChat(): Promise<ItemsPayload> {
+  const res = await fetch(apiURL("/api/chats/more"), {
+    method: "POST",
+    headers: headers(),
+  });
   if (!res.ok) throw new Error(await res.text());
   return res.json();
 }
@@ -131,6 +225,7 @@ export async function probeMediaError(path?: string): Promise<string> {
 
 export function subscribeEvents(
   onData: (payload: ItemsPayload) => void,
+  onProgress?: (payload: ProgressPayload) => void,
   onError?: (err: Event) => void,
 ): () => void {
   const es = new EventSource(apiURL("/api/events"));
@@ -141,8 +236,19 @@ export function subscribeEvents(
       /* ignore malformed */
     }
   };
+  const handleProgress = (event: Event) => {
+    try {
+      onProgress?.(JSON.parse((event as MessageEvent<string>).data) as ProgressPayload);
+    } catch {
+      /* ignore malformed */
+    }
+  };
+  es.addEventListener("progress", handleProgress);
   es.onerror = (err) => onError?.(err);
-  return () => es.close();
+  return () => {
+    es.removeEventListener("progress", handleProgress);
+    es.close();
+  };
 }
 
 export function formatSize(bytes: number): string {
@@ -203,6 +309,12 @@ export function formatMessageDate(unix?: number): string {
 
 /** Strip `{peerId}_{messageId}_` template prefix for UI labels. */
 export function displayName(item: Item): string {
+  if (item.type === "message") {
+    const text = item.text?.trim().split(/\r?\n/, 1)[0];
+    if (text) return text;
+    if (item.message_kind === "service") return "服务消息";
+    if (item.media_unavailable) return "媒体暂不可用";
+  }
   const name = item.name || "";
   const prefix = `${item.peer_id}_${item.message_id}_`;
   if (name.startsWith(prefix)) {
